@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 franka_description
 robotiq_meshes
+videos/
