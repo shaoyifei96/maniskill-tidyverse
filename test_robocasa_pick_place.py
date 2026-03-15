@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """RoboCasa kitchen pick-and-place test.
 
-Combines fixture enumeration, multi-strategy grasp, pick-and-place pipeline,
-success condition evaluation, collision logging, timing, video with text
-banner overlay, and planning-world visualization.
-
 Usage:
     python test_robocasa_pick_place.py --render human --seed 0
     python test_robocasa_pick_place.py --render rgb_array --seed 0
@@ -24,57 +20,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tidyverse_agent   # noqa: F401 — registers 'tidyverse'
 import mani_skill.envs    # noqa: F401 — registers envs
 
-from success_utils import compute_step_flags, format_flags
-from viz_planning_world import save_planning_world
-
 from mplib import Pose as MPPose
 from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld
-from mplib.collision_detection.fcl import (
-    Box, Capsule, Convex, Sphere, BVHModel, Halfspace, Cylinder,
-    CollisionObject, FCLObject,
-)
-from sapien.physx import (
-    PhysxCollisionShapeBox, PhysxCollisionShapeCapsule,
-    PhysxCollisionShapeConvexMesh, PhysxCollisionShapeSphere,
-    PhysxCollisionShapeTriangleMesh, PhysxCollisionShapePlane,
-    PhysxCollisionShapeCylinder, PhysxArticulationLinkComponent,
-)
-from transforms3d.euler import euler2mat, euler2quat
-from scipy.spatial.transform import Rotation as R
-import mplib.sapien_utils.conversion as _conv
 
-from mani_skill.utils.scene_builder.robocasa.fixtures.counter import Counter
-from mani_skill.utils.scene_builder.robocasa.fixtures.stove import Stove, Stovetop
-from mani_skill.utils.scene_builder.robocasa.fixtures.cabinet import (
-    SingleCabinet, HingeCabinet, OpenCabinet, Drawer,
+from motion_utils import (
+    ARM_HOME, GRIPPER_OPEN, GRIPPER_CLOSED, MASK_ARM_ONLY, MASK_WHOLE_BODY,
+    get_robot_qpos, make_action, wait_until_stable, execute_trajectory,
+    actuate_gripper,
 )
-from mani_skill.utils.scene_builder.robocasa.fixtures.microwave import Microwave
-from mani_skill.utils.scene_builder.robocasa.fixtures.accessories import CoffeeMachine
-from mani_skill.utils.scene_builder.robocasa.fixtures.sink import Sink
-from mani_skill.utils.scene_builder.robocasa.fixtures.others import Floor, Wall
+from grasp_strategies import select_grasps, build_place_pose, DROP_HEIGHT
+from planning_utils import sync_planner, build_kitchen_acm  # also applies monkey-patch
+from video_utils import VideoWriter, CollisionLogger
+from placement_utils import (
+    CUBE_HALF, COLORS, spawn_cube, collect_placements,
+)
+from success_utils import compute_step_flags, format_flags
+from viz_planning_world import save_planning_world
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-ARM_HOME = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.913, 0.785])
-GRIPPER_OPEN = 0.0
-GRIPPER_CLOSED = 0.81
 LIFT_HEIGHT = 0.10
-DROP_HEIGHT = 0.10
-CUBE_HALF = 0.02
-
-MASK_ARM_ONLY  = np.array([True] * 3 + [False] * 7 + [True] * 6)
-MASK_WHOLE_BODY = np.array([False] * 3 + [False] * 7 + [True] * 6)
-
 PLANNING_TIMEOUT = 15
 IK_TIMEOUT = 8
-
-COLORS = [
-    [1.0, 0.0, 0.0, 1], [0.0, 0.8, 0.0, 1], [0.0, 0.3, 1.0, 1],
-    [1.0, 0.7, 0.0, 1], [0.8, 0.0, 0.8, 1], [0.0, 0.8, 0.8, 1],
-    [1.0, 1.0, 0.0, 1], [1.0, 0.4, 0.7, 1], [0.6, 0.3, 0.0, 1],
-    [0.5, 0.5, 0.5, 1],
-]
 
 
 # ─── Timeout handler ─────────────────────────────────────────────────────────
@@ -83,528 +51,6 @@ def _timeout_handler(signum, frame):
     raise TimeoutError("planning timeout")
 
 signal.signal(signal.SIGALRM, _timeout_handler)
-
-
-# ─── Monkey-patch: apply scale to Robotiq convex collision meshes ─────────────
-
-@staticmethod
-def _convert_physx_component(comp):
-    shapes, shape_poses = [], []
-    for shape in comp.collision_shapes:
-        shape_poses.append(MPPose(shape.local_pose))
-        if isinstance(shape, PhysxCollisionShapeBox):
-            geom = Box(side=shape.half_size * 2)
-        elif isinstance(shape, PhysxCollisionShapeCapsule):
-            geom = Capsule(radius=shape.radius, lz=shape.half_length * 2)
-            shape_poses[-1] *= MPPose(q=euler2quat(0, np.pi / 2, 0))
-        elif isinstance(shape, PhysxCollisionShapeConvexMesh):
-            verts = shape.vertices
-            if not np.allclose(shape.scale, 1.0):
-                verts = verts * np.array(shape.scale)
-            geom = Convex(vertices=verts, faces=shape.triangles)
-        elif isinstance(shape, PhysxCollisionShapeSphere):
-            geom = Sphere(radius=shape.radius)
-        elif isinstance(shape, PhysxCollisionShapeTriangleMesh):
-            geom = BVHModel()
-            geom.begin_model()
-            geom.add_sub_model(vertices=shape.vertices, faces=shape.triangles)
-            geom.end_model()
-        elif isinstance(shape, PhysxCollisionShapePlane):
-            n = shape_poses[-1].to_transformation_matrix()[:3, 0]
-            d = n.dot(shape_poses[-1].p)
-            geom = Halfspace(n=n, d=d)
-            shape_poses[-1] = MPPose()
-        elif isinstance(shape, PhysxCollisionShapeCylinder):
-            geom = Cylinder(radius=shape.radius, lz=shape.half_length * 2)
-            shape_poses[-1] *= MPPose(q=euler2quat(0, np.pi / 2, 0))
-        else:
-            continue
-        shapes.append(CollisionObject(geom))
-    if not shapes:
-        return None
-    name = (comp.name if isinstance(comp, PhysxArticulationLinkComponent)
-            else _conv.convert_object_name(comp.entity))
-    return FCLObject(name, comp.entity.pose, shapes, shape_poses)
-
-SapienPlanningWorld.convert_physx_component = _convert_physx_component
-
-
-# ─── Video writer ─────────────────────────────────────────────────────────────
-
-class VideoWriter:
-    def __init__(self, path, fps=30, max_width=512):
-        self.path = path
-        self.fps = fps
-        self.max_width = max_width
-        self.writer = None
-        self.frame_count = 0
-
-    def add_frame(self, frame):
-        if frame.ndim == 4:
-            frame = frame[0]
-        h, w = frame.shape[:2]
-        if w > self.max_width:
-            scale = self.max_width / w
-            frame = cv2.resize(frame, (self.max_width, int(h * scale)))
-            h, w = frame.shape[:2]
-        if self.writer is None:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.writer = cv2.VideoWriter(self.path, fourcc, self.fps, (w, h))
-        self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        self.frame_count += 1
-
-    def close(self):
-        if self.writer:
-            self.writer.release()
-            print(f"Video saved: {self.path} ({self.frame_count} frames)")
-
-
-# ─── Collision logger ─────────────────────────────────────────────────────────
-
-class CollisionLogger:
-    def __init__(self, robot, scene, env, img_dir, render_mode='human'):
-        self.robot = robot
-        self.scene = scene
-        self.env = env
-        self.img_dir = img_dir
-        self.render_mode = render_mode
-        import shutil
-        if os.path.exists(img_dir):
-            shutil.rmtree(img_dir)
-        os.makedirs(img_dir, exist_ok=True)
-        self.robot_entity_names = {l.get_name() for l in robot.get_links()}
-        self.seen_pairs = set()
-        self.collision_count = 0
-        self.step_count = 0
-
-    def check(self, step_label=""):
-        self.step_count += 1
-        try:
-            contacts = self.scene.get_contacts()
-        except Exception:
-            return
-        for contact in contacts:
-            if not contact.points:
-                continue
-            impulse = np.sum([pt.impulse for pt in contact.points], axis=0)
-            if np.linalg.norm(impulse) < 1e-4:
-                continue
-            b0, b1 = contact.bodies[0], contact.bodies[1]
-            name0 = b0.entity.name if b0.entity else str(b0)
-            name1 = b1.entity.name if b1.entity else str(b1)
-            is_robot0 = name0 in self.robot_entity_names
-            is_robot1 = name1 in self.robot_entity_names
-            if not (is_robot0 or is_robot1):
-                continue
-            if is_robot0 and is_robot1:
-                continue
-            pair = frozenset((name0, name1))
-            if pair not in self.seen_pairs:
-                self.seen_pairs.add(pair)
-                self.collision_count += 1
-                robot_part = name0 if is_robot0 else name1
-                other_part = name1 if is_robot0 else name0
-                sep = min(pt.separation for pt in contact.points)
-                imp_mag = np.linalg.norm(impulse)
-                print(f"  COLLISION #{self.collision_count} step={self.step_count}: "
-                      f"{robot_part} <-> {other_part}  "
-                      f"impulse={imp_mag:.4f}  sep={sep:.4f}  "
-                      f"[{step_label}]")
-                self._save_image(robot_part, other_part)
-
-    def _save_image(self, robot_part, other_part):
-        try:
-            frame = self.env.render()
-            if isinstance(frame, torch.Tensor):
-                frame = frame.cpu().numpy()
-            if frame.ndim == 4:
-                frame = frame[0]
-            img = frame.astype(np.uint8)
-            text = (f"COLLISION #{self.collision_count} step={self.step_count}: "
-                    f"{robot_part} <-> {other_part}")
-            h = img.shape[0]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            scale = max(0.4, h / 800)
-            thick = max(1, int(h / 400))
-            (tw, th_), _ = cv2.getTextSize(text, font, scale, thick)
-            cv2.rectangle(img, (5, 5), (tw + 15, th_ + 15), (0, 0, 200), -1)
-            cv2.putText(img, text, (10, th_ + 10), font, scale,
-                        (255, 255, 255), thick, cv2.LINE_AA)
-            safe_name = (f"collision_{self.collision_count:03d}"
-                         f"_step{self.step_count:05d}"
-                         f"_{robot_part}_vs_{other_part}.png").replace('/', '_')
-            cv2.imwrite(os.path.join(self.img_dir, safe_name),
-                        cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        except Exception:
-            pass
-
-    def summary(self):
-        print(f"\nCollision summary: {self.collision_count} unique collision pairs "
-              f"detected over {self.step_count} steps")
-        for pair in sorted(self.seen_pairs, key=lambda p: sorted(p)):
-            names = sorted(pair)
-            print(f"  - {names[0]} <-> {names[1]}")
-
-
-# ─── Placement helpers ────────────────────────────────────────────────────────
-
-def local_to_world(fixture, offset):
-    rot_mat = euler2mat(0, 0, fixture.rot)
-    return np.array(fixture.pos) + rot_mat @ np.array(offset)
-
-
-def spawn_cube(scene, name, pos, color):
-    builder = scene.create_actor_builder()
-    hs = np.array([CUBE_HALF] * 3)
-    builder.add_box_collision(half_size=hs)
-    builder.add_box_visual(
-        half_size=hs,
-        material=sapien.render.RenderMaterial(base_color=color),
-    )
-    actor = builder.build(name=name)
-    actor.set_pose(sapien.Pose(p=pos))
-    return actor
-
-
-def _region_placements(fix, regions):
-    results = []
-    for rname, region in regions.items():
-        offset = np.array(region["offset"], dtype=float)
-        wp = local_to_world(fix, offset)
-        wp[2] = fix.pos[2] + offset[2]
-        results.append((rname, wp))
-    return results
-
-
-def _int_sites_placement(fix, suffix="interior"):
-    try:
-        p0, px, py, pz = fix.get_int_sites()
-        cx = np.mean([p0[0], px[0]])
-        cy = np.mean([p0[1], py[1]])
-        cz = p0[2]
-        wp = local_to_world(fix, [cx, cy, cz])
-        wp[2] = fix.pos[2] + cz
-        return [(suffix, wp)]
-    except Exception:
-        return []
-
-
-def collect_placements(fixtures):
-    """Enumerate all placement surfaces.
-    Returns [(label, world_pos, fixture_type_str, fixture_obj)].
-    """
-    all_placements = []
-    for fname, fix in fixtures.items():
-        if isinstance(fix, (Floor, Wall)):
-            continue
-        positions = []
-        ftype = type(fix).__name__
-
-        if isinstance(fix, Counter):
-            try:
-                regions = fix.get_reset_regions(
-                    None, fixtures, ref=None, loc="any", top_size=(0.01, 0.01))
-                positions = _region_placements(fix, regions)
-            except Exception:
-                sz = fix.pos[2] + fix.size[2] / 2
-                positions = [("top", np.array([fix.pos[0], fix.pos[1], sz]))]
-        elif isinstance(fix, (Stove, Stovetop)):
-            try:
-                positions = _region_placements(fix, fix.get_reset_regions(None))
-            except Exception:
-                pass
-        elif isinstance(fix, Drawer):
-            if 0.4 <= fix.pos[2] + fix.size[2] / 2 <= 1.2:
-                positions = _int_sites_placement(fix)
-        elif isinstance(fix, (SingleCabinet, HingeCabinet, OpenCabinet)):
-            positions = _int_sites_placement(fix)
-            top_z = fix.pos[2] + fix.size[2] / 2
-            if 1.0 <= top_z <= 1.6:
-                positions.append(("top", np.array([fix.pos[0], fix.pos[1], top_z])))
-        elif isinstance(fix, Microwave):
-            positions = _int_sites_placement(fix)
-        elif isinstance(fix, CoffeeMachine):
-            try:
-                positions = _region_placements(fix, fix.get_reset_regions())
-            except Exception:
-                pass
-        elif isinstance(fix, Sink):
-            positions = _int_sites_placement(fix, suffix="basin")
-
-        for rname, pos in positions:
-            all_placements.append((f"{fname}_{rname}", pos, ftype, fix))
-
-    return all_placements
-
-
-# ─── Motion helpers ───────────────────────────────────────────────────────────
-
-def get_robot_qpos(robot):
-    return robot.get_qpos().cpu().numpy()[0]
-
-
-def make_action(arm_qpos, gripper, base_cmd):
-    act = np.concatenate([arm_qpos, [gripper], base_cmd])
-    return torch.tensor(act, dtype=torch.float32).unsqueeze(0)
-
-
-def sync_planner(planner):
-    try:
-        planner.update_from_simulation()
-    except Exception:
-        pass
-
-
-def wait_until_stable(step_fn, hold, robot, max_steps=300,
-                      vel_thresh=1e-3, window=10):
-    stable_count = 0
-    for si in range(max_steps):
-        step_fn(hold)
-        qvel = robot.get_qvel().cpu().numpy()[0]
-        if np.max(np.abs(qvel)) < vel_thresh:
-            stable_count += 1
-            if stable_count >= window:
-                return si + 1
-        else:
-            stable_count = 0
-    return max_steps
-
-
-def execute_trajectory(traj, step_fn, gripper, lock_base=False,
-                       robot=None, settle_thresh=0.01, settle_steps=100):
-    base_cmd = traj[0, 0:3] if lock_base else None
-    for i in range(traj.shape[0]):
-        b = base_cmd if lock_base else traj[i, 0:3]
-        step_fn(make_action(traj[i, 3:10], gripper, b))
-
-    final_arm = traj[-1, 3:10]
-    final_base = base_cmd if lock_base else traj[-1, 0:3]
-    final_act = make_action(final_arm, gripper, final_base)
-
-    if robot is not None:
-        for _ in range(settle_steps):
-            step_fn(final_act)
-            qpos = get_robot_qpos(robot)
-            arm_err = np.max(np.abs(qpos[3:10] - final_arm))
-            base_err = np.max(np.abs(qpos[0:3] - final_base))
-            if arm_err < settle_thresh and base_err < settle_thresh:
-                break
-
-
-def actuate_gripper(step_fn, robot, gripper_val, n_steps=30):
-    qpos = get_robot_qpos(robot)
-    action = make_action(qpos[3:10], gripper_val, qpos[0:3])
-    for _ in range(n_steps):
-        step_fn(action)
-
-
-def check_joint_limits(qpos, joint_limits, joint_names, label=""):
-    qi = 0
-    for limits, name in zip(joint_limits, joint_names):
-        if limits.ndim == 2:
-            for d in range(limits.shape[0]):
-                if qi >= len(qpos):
-                    return
-                lo, hi = limits[d, 0], limits[d, 1]
-                margin = (hi - lo) * 0.02
-                if qpos[qi] <= lo + margin or qpos[qi] >= hi - margin:
-                    print(f"    JOINT LIMIT {label}: {name}[{d}] = {qpos[qi]:.4f}")
-                qi += 1
-        elif limits.ndim == 1 and limits.shape[0] >= 2:
-            qi += 1
-        else:
-            qi += 1
-
-
-# ─── ACM builder ─────────────────────────────────────────────────────────────
-
-def _get_object_position(pw, name):
-    try:
-        return np.array(pw.get_object(name).pose.p)
-    except Exception:
-        return None
-
-
-def build_kitchen_acm(pw, planner, cube_names, mode='relaxed',
-                      robot_pos=None, near_radius=3.0):
-    acm = pw.get_allowed_collision_matrix()
-    art_names = pw.get_articulation_names()
-    robot_link_names = planner.pinocchio_model.get_link_names()
-    robot_art = next(n for n in art_names if 'tidyverse' in n.lower())
-
-    print(f"\n  Planning world contents (ACM mode={mode}):")
-    print(f"    Robot links ({len(robot_link_names)}): {robot_link_names[:5]}...")
-    print(f"    Articulations ({len(art_names)}):")
-
-    # Classify articulations by distance
-    relaxed_arts, checked_arts = [], []
-    for an in art_names:
-        if an == robot_art:
-            print(f"      [ROBOT] {an}")
-            continue
-        fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
-        if mode == 'relaxed':
-            relaxed_arts.append(an)
-            print(f"      [RELAXED] {an} ({len(fl)} links)")
-        else:
-            # Estimate articulation position from its first link's FCL object
-            art = pw.get_articulation(an)
-            fcl_model = art.get_fcl_model()
-            col_objs = fcl_model.get_collision_objects()
-            art_pos = None
-            if col_objs:
-                art_pos = np.array(col_objs[0].pose.p)
-            if art_pos is not None and robot_pos is not None:
-                dist = np.linalg.norm(art_pos[:2] - robot_pos[:2])
-                if dist > near_radius:
-                    relaxed_arts.append(an)
-                    print(f"      [RELAXED] {an} ({len(fl)} links)  dist={dist:.2f}m")
-                else:
-                    checked_arts.append((an, dist))
-                    print(f"      [CHECKED] {an} ({len(fl)} links)  dist={dist:.2f}m")
-            else:
-                checked_arts.append((an, -1))
-                print(f"      [CHECKED] {an} ({len(fl)} links)  dist=unknown")
-
-    obj_names = pw.get_object_names()
-    checked_objs = [n for n in obj_names if n in cube_names]
-
-    # Classify static objects by distance
-    relaxed_static, checked_static = [], []
-    for on in obj_names:
-        if on in cube_names:
-            continue
-        if mode == 'relaxed':
-            relaxed_static.append(on)
-        else:
-            pos = _get_object_position(pw, on)
-            if pos is not None and robot_pos is not None:
-                dist = np.linalg.norm(pos[:2] - robot_pos[:2])
-                if dist > near_radius:
-                    relaxed_static.append(on)
-                else:
-                    checked_static.append((on, dist))
-            else:
-                checked_static.append((on, -1))
-
-    print(f"    Static objects ({len(obj_names)} total):")
-    print(f"      Cubes (always checked): {len(checked_objs)}")
-    if mode == 'strict':
-        print(f"      Collision-checked arts (near): {len(checked_arts)}")
-        print(f"      Collision-checked static (near, <{near_radius}m): {len(checked_static)}")
-        for on, d in sorted(checked_static, key=lambda x: x[1]):
-            print(f"        - {on}  dist={d:.2f}m")
-    print(f"      ACM-relaxed arts: {len(relaxed_arts)}")
-    print(f"      ACM-relaxed static: {len(relaxed_static)}")
-
-    # Apply ACM — only relax far objects
-    for an in relaxed_arts:
-        fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
-        for rl in robot_link_names:
-            for f in fl:
-                acm.set_entry(rl, f, True)
-    for on in relaxed_static:
-        for rl in robot_link_names:
-            acm.set_entry(rl, on, True)
-
-    # Resolve initial collisions
-    sync_planner(planner)
-    collisions = pw.check_collision()
-    init_relaxed = []
-    if collisions:
-        print(f"\n  Initial planner collisions ({len(collisions)}):")
-        for c in collisions:
-            print(f"    {c.link_name1}({c.object_name1}) <-> "
-                  f"{c.link_name2}({c.object_name2})")
-            for obj_name in [c.object_name1, c.object_name2]:
-                if obj_name and obj_name not in cube_names:
-                    if not any('tidyverse' in obj_name.lower() for _ in [1]):
-                        for rl in robot_link_names:
-                            acm.set_entry(rl, obj_name, True)
-                        init_relaxed.append(obj_name)
-        if init_relaxed:
-            print(f"    Auto-relaxed {len(set(init_relaxed))} objects")
-            sync_planner(planner)
-    else:
-        print(f"\n  No initial planner collisions")
-
-    n_checked_s = len(checked_static) - len(set(init_relaxed))
-    print(f"\n  ACM summary: {len(relaxed_arts)} arts relaxed, "
-          f"{len(checked_arts)} arts checked, "
-          f"{len(relaxed_static)} static relaxed, "
-          f"{max(0, n_checked_s)} static checked, "
-          f"{len(checked_objs)} cubes checked")
-
-
-# ─── Grasp strategy ──────────────────────────────────────────────────────────
-
-def build_object_grasps(obj_pos, arm_base):
-    """Grasp poses for free objects (blocks, cups, etc.): Angled45 + Top-Down.
-
-    For each strategy, generates 4 yaw rotations (0°, 90°, 180°, 270°)
-    since symmetric objects can be grasped from any direction.
-    """
-    base_yaw = np.arctan2(obj_pos[1] - arm_base[1], obj_pos[0] - arm_base[0])
-    grasps = []
-    for i, yaw_offset in enumerate([0, np.pi / 2, np.pi, -np.pi / 2]):
-        yaw = base_yaw + yaw_offset
-        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-        deg = int(np.degrees(yaw_offset))
-        grasps.append((
-            f'Angled45-{deg}',
-            obj_pos + np.array([-0.02 * cos_y, -0.02 * sin_y, 0.02]),
-            np.array(euler2quat(0, 3 * np.pi / 4, yaw)),
-        ))
-    for i, yaw_offset in enumerate([0, np.pi / 2, np.pi, -np.pi / 2]):
-        yaw = base_yaw + yaw_offset
-        deg = int(np.degrees(yaw_offset))
-        grasps.append((
-            f'Top-Down-{deg}',
-            obj_pos.copy(),
-            np.array(euler2quat(0, np.pi, yaw)),
-        ))
-    return grasps
-
-
-def build_handle_grasps(handle_pos, arm_base):
-    """Grasp poses for handles: Front + Front-Vertical (rotated 90 deg)."""
-    yaw = np.arctan2(handle_pos[1] - arm_base[1],
-                     handle_pos[0] - arm_base[0])
-    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-    front_rot = R.from_euler('yz', [np.pi / 2, yaw])
-    front_vert_rot = front_rot * R.from_euler('z', np.pi / 2)
-    return [
-        ('Front',
-         handle_pos + np.array([-0.06 * cos_y, -0.06 * sin_y, 0.08]),
-         np.array(front_rot.as_quat()[[3, 0, 1, 2]])),
-        ('Front-Vertical',
-         handle_pos + np.array([-0.06 * cos_y, -0.06 * sin_y, 0.08]),
-         np.array(front_vert_rot.as_quat()[[3, 0, 1, 2]])),
-    ]
-
-
-def select_grasps(obj_pos, arm_base, ftype, label):
-    """Select ordered grasp list based on object/fixture type."""
-    is_handle = 'handle' in label.lower()
-    if is_handle:
-        return build_handle_grasps(obj_pos, arm_base)
-    # All non-handle objects: Angled45 preferred, then Top-Down
-    grasps = build_object_grasps(obj_pos, arm_base)
-    is_enclosed = 'interior' in label
-    if is_enclosed:
-        # Inside a fixture — reverse order to try Top-Down first
-        return list(reversed(grasps))
-    elif ftype in ('Stove', 'Stovetop'):
-        return [g for g in grasps if g[0] == 'Top-Down'] + \
-               [g for g in grasps if g[0] != 'Top-Down']
-    return grasps
-
-
-def build_place_pose(dest_pos, arm_base):
-    p = dest_pos.copy()
-    p[2] += DROP_HEIGHT
-    q = np.array([0, 1, 0, 0])  # top-down
-    return p, q
 
 
 # ─── Pick-and-place attempt ──────────────────────────────────────────────────
@@ -925,7 +371,6 @@ def main():
     step_label = ["idle"]
 
     def _burn_label(frame, text):
-        """Small text banner on top of frame."""
         h = frame.shape[0]
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = max(0.35, h / 900)
@@ -950,8 +395,7 @@ def main():
             video_writer.add_frame(frame)
         collision_logger.check(step_label[0])
 
-    # --- Base initialization: use qpos (not world pose) to avoid drift ---
-    # This matches test_base_debug.py: action base_cmd = qpos[:3], not robot.pose.p
+    # --- Base initialization ---
     base_qpos = get_robot_qpos(robot)[:3].copy()
     arm_base = next(l for l in robot.get_links()
                     if l.get_name() == 'panda_link0').pose.p[0].cpu().numpy()
@@ -971,7 +415,6 @@ def main():
 
     # Build task list: pick a single fixed destination, all blocks go there
     rng = np.random.RandomState(args.seed)
-    # Choose destination: use --dest-label if given, else nearest placement
     dest_entry = None
     if args.dest_label:
         dest_entry = next((r for r in reachable
@@ -987,7 +430,7 @@ def main():
     tasks = []
     for i, (s_label, s_pos, s_ftype, s_fix, s_dist) in enumerate(reachable):
         if s_label == d_label:
-            continue  # don't pick from destination
+            continue
         tasks.append({
             'src_label': s_label, 'src_pos': s_pos, 'src_ftype': s_ftype,
             'src_fix': s_fix, 'src_dist': s_dist,
