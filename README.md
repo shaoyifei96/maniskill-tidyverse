@@ -77,6 +77,80 @@ All modes use action order: **`[arm, gripper, base]`**
 
 > **Note:** In `pd_joint_pos` and `pd_joint_delta_pos`, the base uses **velocity** control. In `whole_body`, the base uses **position** control — required for motion planning.
 
+## EEF Orientation Convention
+
+The planner takes target poses as `MPPose(p=position, q=quaternion_wxyz)`.
+
+Orientations are specified in the **world frame** (with `wrt_world=True`, the default).
+
+**World frame axes:** X = forward, Y = left, Z = up
+
+**EEF link frame:** The `eef` link's local Z-axis points along the gripper approach direction (the direction the fingers point). At identity quaternion `[1,0,0,0]`, the gripper points **up**.
+
+### Euler XYZ to Quaternion
+
+```python
+from scipy.spatial.transform import Rotation as R
+
+rot = R.from_euler('xyz', [rx, ry, rz])  # radians
+q_xyzw = rot.as_quat()
+q_wxyz = [q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]]  # mplib uses wxyz
+target = MPPose(p=position, q=q_wxyz)
+```
+
+### Axis Effects (rotation applied to EEF Z-axis)
+
+| Axis | Effect | Formula |
+|------|--------|---------|
+| **Ry(θ)** | Tilts gripper toward **+X (forward)** | Z → `[sinθ, 0, cosθ]` |
+| **Rx(θ)** | Tilts gripper toward **-Y (right)** | Z → `[0, -sinθ, cosθ]` |
+| **Rz(θ)** | Spins gripper in place (yaw) | Z unchanged |
+
+### Typical Grasp Orientations
+
+All common grasps use **Ry rotation** to control the approach angle:
+
+| Grasp Type | Euler XYZ (deg) | Euler XYZ (rad) | Quaternion (wxyz) | Description |
+|------------|----------------|-----------------|-------------------|-------------|
+| **Top-down** | `[0, 180, 0]` | `[0, π, 0]` | `[0, 0, 0, -1]` | Gripper straight down, fingers along X |
+| **45° angled** | `[0, 135, 0]` | `[0, 3π/4, 0]` | `[0.383, 0, 0.924, 0]` | 45° between down and forward |
+| **Forward** | `[0, 90, 0]` | `[0, π/2, 0]` | `[0.707, 0, 0.707, 0]` | Gripper horizontal, pointing forward |
+
+To rotate the finger orientation (yaw) around the approach axis, add **Rz**:
+
+| Variant | Euler XYZ (deg) | Description |
+|---------|----------------|-------------|
+| Top-down + yaw 90° | `[0, 180, 90]` | Down, fingers along Y |
+| Forward + yaw 45° | `[0, 90, 45]` | Forward, fingers rotated 45° |
+
+### Code Example
+
+```python
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from mplib import Pose as MPPose
+
+def grasp_pose(position, approach='top_down', yaw_deg=0):
+    """Create a grasp pose with common orientations.
+    
+    Args:
+        position: [x, y, z] target position
+        approach: 'top_down', 'angled_45', or 'forward'
+        yaw_deg: rotation around approach axis (finger orientation)
+    """
+    ry = {'top_down': np.pi, 'angled_45': 3*np.pi/4, 'forward': np.pi/2}[approach]
+    rz = np.radians(yaw_deg)
+    rot = R.from_euler('xyz', [0, ry, rz])
+    q = rot.as_quat()  # xyzw
+    return MPPose(p=np.array(position), q=[q[3], q[0], q[1], q[2]])  # wxyz
+
+# Examples
+top_down   = grasp_pose([0.5, 0, 0.1], 'top_down')
+angled     = grasp_pose([0.5, 0, 0.1], 'angled_45')
+forward    = grasp_pose([0.5, 0, 0.1], 'forward')
+top_yaw90  = grasp_pose([0.5, 0, 0.1], 'top_down', yaw_deg=90)
+```
+
 ## Motion Planning (mplib 0.2.1)
 
 Full whole-body 10-DOF motion planning (3 base + 7 arm) with sub-millimeter accuracy.
