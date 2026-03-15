@@ -139,7 +139,7 @@ class TidyVerse(BaseAgent):
     gripper_friction = 1
 
     base_stiffness = 1e3
-    base_damping = 1e2
+    base_damping = 520  # ~critical damping for ~67kg total mass: 2*sqrt(Kp*m)
     base_force_limit = 600
 
     @property

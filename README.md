@@ -254,6 +254,33 @@ obs, info = env.reset(seed=42)
 
 153 object categories available. See [object spawning example](https://github.com/shaoyifei96/maniskill-tidyverse/wiki) for placing objects on counter surfaces.
 
+## Table Grasp Test
+
+`test_table_grasp.py` — end-to-end pick test with a table and a small red block. The robot plans pre-grasp, approach, close gripper, and lift for three grasp strategies (top-down, front, angled 45°).
+
+```bash
+# GUI mode
+python test_table_grasp.py --render human
+
+# Record video (saved to videos/)
+python test_table_grasp.py --render rgb_array
+
+# Options
+python test_table_grasp.py --robot-x -0.3 --table-x 0.0 --table-height 0.762
+```
+
+Uses `SapienPlanner` / `SapienPlanningWorld` for collision-aware motion planning with automatic obstacle detection. Includes detailed diagnostics on planning failure (IK feasibility, obstacle list, collision pairs).
+
+### Gripper Control
+
+The Robotiq 85 gripper joint range is `[0, 0.81]` rad in `whole_body` mode (`normalize_action=False`):
+- **0.0** = fully open
+- **0.81** = fully closed
+
+### Base PD Gains
+
+Base uses critically damped PD control (Kp=1000, Kd=520) for fast settling without oscillation.
+
 ## Known Limitations
 
 - `RoboCasaKitchen-v1` is a scene viewer — no task definitions or `_check_success()`
@@ -266,6 +293,7 @@ obs, info = env.reset(seed=42)
 
 ```
 maniskill-tidyverse/
+├── test_table_grasp.py              # Table-top grasp test (3 strategies, video recording)
 ├── tidyverse_agent.py              # Agent class, registered as 'tidyverse'
 ├── tidyverse.urdf                   # Full URDF (for ManiSkill rendering)
 ├── tidyverse_bare.urdf              # Planning URDF (box collisions, whole-body)
