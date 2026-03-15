@@ -6,7 +6,7 @@ import cv2
 
 
 class VideoWriter:
-    def __init__(self, path, fps=30, max_width=512):
+    def __init__(self, path, fps=30, max_width=1024):
         self.path = path
         self.fps = fps
         self.max_width = max_width

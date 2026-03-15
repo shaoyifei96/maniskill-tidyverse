@@ -4,19 +4,18 @@ from transforms3d.euler import euler2quat
 from scipy.spatial.transform import Rotation as R
 
 
-DROP_HEIGHT = 0.10
+DROP_HEIGHT = 0.05
 
 
-def build_object_grasps(obj_pos, arm_base):
+def build_object_grasps(obj_pos, arm_base, obj_yaw=0.0):
     """Grasp poses for free objects (blocks, cups, etc.): Angled45 + Top-Down.
 
-    For each strategy, generates 4 yaw rotations (0, 90, 180, 270 deg)
-    since symmetric objects can be grasped from any direction.
+    Generates 4 yaw rotations (0, 90, 180, 270 deg) relative to the
+    object's own yaw so gripper fingers align with object faces.
     """
-    base_yaw = np.arctan2(obj_pos[1] - arm_base[1], obj_pos[0] - arm_base[0])
     grasps = []
     for i, yaw_offset in enumerate([0, np.pi / 2, np.pi, -np.pi / 2]):
-        yaw = base_yaw + yaw_offset
+        yaw = obj_yaw + yaw_offset
         cos_y, sin_y = np.cos(yaw), np.sin(yaw)
         deg = int(np.degrees(yaw_offset))
         grasps.append((
@@ -25,7 +24,7 @@ def build_object_grasps(obj_pos, arm_base):
             np.array(euler2quat(0, 3 * np.pi / 4, yaw)),
         ))
     for i, yaw_offset in enumerate([0, np.pi / 2, np.pi, -np.pi / 2]):
-        yaw = base_yaw + yaw_offset
+        yaw = obj_yaw + yaw_offset
         deg = int(np.degrees(yaw_offset))
         grasps.append((
             f'Top-Down-{deg}',
@@ -52,13 +51,13 @@ def build_handle_grasps(handle_pos, arm_base):
     ]
 
 
-def select_grasps(obj_pos, arm_base, ftype, label):
+def select_grasps(obj_pos, arm_base, ftype, label, obj_yaw=0.0):
     """Select ordered grasp list based on object/fixture type."""
     is_handle = 'handle' in label.lower()
     if is_handle:
         return build_handle_grasps(obj_pos, arm_base)
     # All non-handle objects: Angled45 preferred, then Top-Down
-    grasps = build_object_grasps(obj_pos, arm_base)
+    grasps = build_object_grasps(obj_pos, arm_base, obj_yaw=obj_yaw)
     is_enclosed = 'interior' in label
     if is_enclosed:
         # Inside a fixture — reverse order to try Top-Down first
@@ -69,8 +68,21 @@ def select_grasps(obj_pos, arm_base, ftype, label):
     return grasps
 
 
-def build_place_pose(dest_pos, arm_base):
-    p = dest_pos.copy()
-    p[2] += DROP_HEIGHT
-    q = np.array([0, 1, 0, 0])  # top-down
-    return p, q
+def build_place_poses(dest_pos, arm_base):
+    """Place poses: Angled45 (preferred) then Top-Down, 4 world-frame yaws each."""
+    poses = []
+    for yaw in [0, np.pi / 2, np.pi, -np.pi / 2]:
+        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+        deg = int(np.degrees(yaw))
+        p = dest_pos.copy()
+        p[2] += DROP_HEIGHT
+        p += np.array([-0.02 * cos_y, -0.02 * sin_y, 0.0])
+        q = np.array(euler2quat(0, 3 * np.pi / 4, yaw))
+        poses.append((f'Place-Angled45-{deg}', p, q))
+    for yaw in [0, np.pi / 2, np.pi, -np.pi / 2]:
+        deg = int(np.degrees(yaw))
+        p = dest_pos.copy()
+        p[2] += DROP_HEIGHT
+        q = np.array(euler2quat(0, np.pi, yaw))
+        poses.append((f'Place-TopDown-{deg}', p, q))
+    return poses

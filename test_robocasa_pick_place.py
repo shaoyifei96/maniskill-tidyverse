@@ -28,7 +28,7 @@ from motion_utils import (
     get_robot_qpos, make_action, wait_until_stable, execute_trajectory,
     actuate_gripper,
 )
-from grasp_strategies import select_grasps, build_place_pose, DROP_HEIGHT
+from grasp_strategies import select_grasps, build_place_poses, DROP_HEIGHT
 from planning_utils import sync_planner, build_kitchen_acm  # also applies monkey-patch
 from video_utils import VideoWriter, CollisionLogger
 from placement_utils import (
@@ -97,7 +97,16 @@ def attempt_pick_place(task_idx, cube_pos, src_label, src_ftype,
         return make_action(q[3:10], GRIPPER_CLOSED, q[:3])
 
     # --- Try grasp strategies ---
-    ordered = select_grasps(cube_pos, arm_base, src_ftype, src_label)
+    # Extract block yaw from its current pose so grasps align with faces
+    from transforms3d.euler import quat2euler
+    cube_q = cube_actor.pose.q
+    if hasattr(cube_q, 'cpu'):
+        cube_q = cube_q[0].cpu().numpy()
+    else:
+        cube_q = np.asarray(cube_q)
+    _, _, obj_yaw = quat2euler(cube_q)
+    ordered = select_grasps(cube_pos, arm_base, src_ftype, src_label,
+                            obj_yaw=obj_yaw)
 
     grasped = False
     used_arm_only = False
@@ -212,32 +221,38 @@ def attempt_pick_place(task_idx, cube_pos, src_label, src_ftype,
     _record_flags('lift')
     _snap("3_lifted")
 
-    # --- Move to place pose ---
-    _set_label("Place")
-    place_p, place_q = build_place_pose(dest_pos, arm_base)
-    place_pose = MPPose(p=place_p, q=place_q)
-    sync_planner(planner)
-    cq = get_robot_qpos(robot)
-    t0 = time.time()
-    signal.alarm(PLANNING_TIMEOUT)
-    try:
-        r_place = planner.plan_pose(place_pose, cq, mask=motion_mask,
-                                     planning_time=5.0)
-    except TimeoutError:
-        r_place = {'status': 'TIMEOUT'}
-    finally:
-        signal.alarm(0)
-    dt = time.time() - t0
-    timings['planning'] += dt
-
-    if r_place['status'] == 'Success':
-        print(f"    Place: OK ({r_place['position'].shape[0]} wp)  [{dt:.2f}s]")
+    # --- Move to place pose (try multiple orientations) ---
+    place_candidates = build_place_poses(dest_pos, arm_base)
+    placed = False
+    for pname, place_p, place_q in place_candidates:
+        _set_label(f"Place ({pname})")
+        place_pose = MPPose(p=place_p, q=place_q)
+        sync_planner(planner)
+        cq = get_robot_qpos(robot)
         t0 = time.time()
-        execute_trajectory(r_place['position'], step_fn, GRIPPER_CLOSED,
-                           lock_base=used_arm_only, robot=robot)
-        timings['exec'] += time.time() - t0
-    else:
-        print(f"    Place: FAILED — {r_place['status']}  [{dt:.2f}s]")
+        signal.alarm(PLANNING_TIMEOUT)
+        try:
+            r_place = planner.plan_pose(place_pose, cq, mask=motion_mask,
+                                         planning_time=5.0)
+        except TimeoutError:
+            r_place = {'status': 'TIMEOUT'}
+        finally:
+            signal.alarm(0)
+        dt = time.time() - t0
+        timings['planning'] += dt
+
+        if r_place['status'] == 'Success':
+            print(f"    Place ({pname}): OK ({r_place['position'].shape[0]} wp)  [{dt:.2f}s]")
+            t0 = time.time()
+            execute_trajectory(r_place['position'], step_fn, GRIPPER_CLOSED,
+                               lock_base=used_arm_only, robot=robot)
+            timings['exec'] += time.time() - t0
+            placed = True
+            break
+        else:
+            print(f"    Place ({pname}): FAILED — {r_place['status']}  [{dt:.2f}s]")
+    if not placed:
+        print(f"    Place: all {len(place_candidates)} orientations failed")
 
     # --- Open gripper ---
     _set_label("Release")
