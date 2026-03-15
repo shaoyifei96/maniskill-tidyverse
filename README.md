@@ -262,14 +262,33 @@ obs, info = env.reset(seed=42)
 # GUI mode
 python test_table_grasp.py --render human
 
-# Record video (saved to videos/)
+# Record video with text overlays (saved to videos/)
 python test_table_grasp.py --render rgb_array
 
 # Options
 python test_table_grasp.py --robot-x -0.3 --table-x 0.0 --table-height 0.762
 ```
 
-Uses `SapienPlanner` / `SapienPlanningWorld` for collision-aware motion planning with automatic obstacle detection. Includes detailed diagnostics on planning failure (IK feasibility, obstacle list, collision pairs).
+Uses `SapienPlanner` / `SapienPlanningWorld` for collision-aware motion planning with automatic obstacle detection.
+
+### Planning Strategy
+
+1. **Grasp IK** — solve IK for the grasp pose first (arm-only, then whole-body fallback)
+2. **Pre-grasp IK** — solve IK for the pre-grasp pose (8cm above), seeded from the grasp IK solution so the arm config is already close to what approach needs
+3. **Pre-grasp path** — plan joint-space path from current config to the pre-grasp IK solution
+4. **Approach** — plan from pre-grasp down to the grasp pose (arm-only if grasp IK was arm-only, otherwise whole-body)
+5. **Close gripper** → **Lift** → **Open gripper** → **Return to home**
+
+This IK-seeded approach ensures the pre-grasp arm configuration is close to the grasp configuration, so the approach step is a short, smooth motion rather than a large reconfiguration.
+
+### Features
+
+- **Arm-only with whole-body fallback**: tries arm-only first (base stays fixed), falls back to whole-body (base moves) if needed
+- **Base locking**: when using arm-only planning, base commands from the trajectory are clamped to prevent RRT drift
+- **Settle check**: waits for both arm and base joints to converge after each trajectory
+- **Video recording**: text overlays showing current stage, 1-second pause between stages
+- **Failure diagnostics**: IK feasibility, obstacle list, collision pairs, joint limit warnings
+- **No physics resets**: drops the block and plans back to home between grasps instead of teleporting
 
 ### Gripper Control
 
