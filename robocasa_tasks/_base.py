@@ -175,12 +175,35 @@ class Kitchen(RoboCasaKitchenEnv):
     
     def evaluate(self):
         if hasattr(self, '_check_success'):
+            # Lazy-init attributes that _reset_internal would have set
+            self._ensure_reset_attrs()
             try:
                 success = self._check_success()
                 return {"success": bool(success)}
             except Exception as e:
                 return {"success": False, "error": str(e)}
         return {}
+
+    def compute_robot_base_placement_pose(self, fixture, **kwargs):
+        """Stub for RoboCasa's base placement computation. Returns fixture pos + facing direction."""
+        pos = np.array(getattr(fixture, 'pos', [0, 0, 0]))[:2]
+        # Default: stand 0.5m in front of fixture (facing it)
+        offset = np.array([0.5, 0.0])
+        return pos + offset, 0.0
+
+    def _ensure_reset_attrs(self):
+        """Set attributes that _reset_internal() normally sets, using SAPIEN state."""
+        # self.knob — used by stove tasks (SearingMeat, MultistepSteaming, etc.)
+        if not hasattr(self, 'knob') and hasattr(self, 'stove') and hasattr(self, 'knob_id'):
+            try:
+                valid = list(self.stove.get_knobs_state(env=self).keys())
+                if valid:
+                    self.knob = valid[0]  # default to first knob
+            except Exception:
+                pass
+        # self.target_location — used by some navigate tasks
+        if not hasattr(self, 'target_location') and hasattr(self, 'init_robot_base_pos'):
+            self.target_location = getattr(self, 'init_robot_base_pos', None)
     
     def get_obj_lang(self):
         """Get language description of the main object."""
@@ -246,7 +269,16 @@ class Kitchen(RoboCasaKitchenEnv):
         if not self.fixtures_only and not hasattr(self, '_get_obj_cfgs'):
             # Provide a minimal _get_obj_cfgs so parent runs _setup_kitchen_references
             self._get_obj_cfgs = lambda: []
-        return super()._load_scene(options)
+        result = super()._load_scene(options)
+        # Try to run _reset_internal to set task-specific attrs (e.g. self.knob, self.target)
+        # Guard: only if it's defined on the subclass (not the RoboCasa base)
+        if hasattr(type(self), '_reset_internal') and type(self)._reset_internal is not \
+                getattr(type(self).__mro__[1], '_reset_internal', None):
+            try:
+                type(self)._reset_internal(self)
+            except Exception:
+                pass  # Silently ignore SAPIEN-incompatible parts
+        return result
 
     def register_fixture_ref(self, ref_name, fn_kwargs):
         """Override to handle missing fixture types gracefully."""
@@ -296,8 +328,21 @@ class Kitchen(RoboCasaKitchenEnv):
 
     @property
     def sim(self):
-        """Stub: RoboCasa tasks call self.sim (MuJoCo). Return None-safe shim."""
-        return _SimShim()
+        """Stub: RoboCasa tasks call self.sim (MuJoCo). Return env-aware shim."""
+        return _SimShim(self)
+
+    @property
+    def obj_body_id(self):
+        """RoboCasa compat: maps object name → integer index (used for body_xpos lookup)."""
+        scene_idx = getattr(self, '_scene_idx_to_be_loaded', 0)
+        mapping = {}
+        for i, (name, info) in enumerate(self.object_actors[scene_idx].items()):
+            mapping[name] = i
+            # Also map via the object's .name attribute if different
+            actor = info.get("actor")
+            if actor and hasattr(actor, 'name') and actor.name != name:
+                mapping[actor.name] = i
+        return mapping
 
     def _get_objects_dict(self):
         """RoboCasa compat: returns object dict for current env index."""
@@ -311,10 +356,143 @@ class Kitchen(RoboCasaKitchenEnv):
 
 
 class _SimShim:
-    """Null-safe shim for self.sim calls from RoboCasa _check_success methods."""
-    class _Data:
-        def __getattr__(self, name):
-            return None
-    data = _Data()
+    """Env-aware shim for self.sim calls from RoboCasa _check_success methods."""
+    model = None  # No MuJoCo model
+
+    def __init__(self, env=None):
+        self._env = env
+        self.data = _SimData(env)
+
     def __getattr__(self, name):
         return None
+
+
+class _SimData:
+    """Shim for sim.data — provides body_xpos and get_site_xpos via SAPIEN."""
+
+    def __init__(self, env):
+        self._env = env
+
+    @property
+    def body_xpos(self):
+        """Returns a dict-like object: body_xpos[idx] → position array."""
+        return _BodyXposProxy(self._env)
+
+    def get_site_xpos(self, site_name):
+        """Look up site position from articulation XML data."""
+        env = self._env
+        if env is None:
+            return np.zeros(3)
+        # Search all articulations for a site matching this name
+        for art in env.scene.get_all_articulations():
+            loader = getattr(art, 'loader', None)
+            if loader is None:
+                continue
+            xml = getattr(loader, 'xml', None)
+            if xml is None:
+                continue
+            site = xml.find(f".//*site[@name='{site_name}']")
+            if site is not None:
+                pos_str = site.get('pos', '0 0 0')
+                local_pos = np.array([float(x) for x in pos_str.split()])
+                # Transform by articulation root pose
+                art_pos = art.pose.p
+                if hasattr(art_pos, 'cpu'):
+                    art_pos = art_pos[0].cpu().numpy()
+                return np.array(art_pos) + local_pos
+        # Fallback: search fixtures
+        scene_idx = getattr(env, '_scene_idx_to_be_loaded', 0)
+        try:
+            for fx_name, fx in env.fixture_refs[scene_idx].items():
+                if hasattr(fx, 'loader') and fx.loader is not None:
+                    xml = getattr(fx.loader, 'xml', None)
+                    if xml is None:
+                        continue
+                    site = xml.find(f".//*site[@name='{site_name}']")
+                    if site is not None:
+                        pos_str = site.get('pos', '0 0 0')
+                        local_pos = np.array([float(x) for x in pos_str.split()])
+                        fx_pos = np.array(getattr(fx, 'pos', [0, 0, 0]))
+                        return fx_pos + local_pos
+        except Exception:
+            pass
+        return np.zeros(3)
+
+    @property
+    def qpos(self):
+        """Allow sim.data.qpos[joint_id] — return zeros (joints not tracked this way)."""
+        return _QposProxy(self._env)
+
+    def set_joint_qpos(self, *args, **kwargs):
+        pass  # no-op in eval mode
+
+    @property
+    def xquat(self):
+        """sim.data.xquat[idx] → identity quaternion proxy."""
+        return _QuatProxy(self._env)
+
+    @property
+    def site_xpos(self):
+        """sim.data.site_xpos[site_id] → zeros proxy (site ids not tracked)."""
+        return _ZerosProxy()
+
+    def __getattr__(self, name):
+        return _ZerosProxy()  # Safe fallback: returns zeros for any attribute access
+
+
+class _ZerosProxy:
+    """Safe fallback proxy that returns np.zeros(3) for any index."""
+    def __getitem__(self, idx):
+        return np.zeros(3)
+    def __call__(self, *a, **kw):
+        return np.zeros(3)
+
+
+class _QuatProxy:
+    """sim.data.xquat[idx] → identity quaternion [1,0,0,0]."""
+    def __init__(self, env):
+        self._env = env
+
+    def __getitem__(self, idx):
+        import numpy as _np
+        # Try to get actual orientation from actor
+        env = self._env
+        if env is not None:
+            scene_idx = getattr(env, '_scene_idx_to_be_loaded', 0)
+            actors = list(env.object_actors[scene_idx].values())
+            if isinstance(idx, int) and 0 <= idx < len(actors):
+                actor = actors[idx]["actor"]
+                q = actor.pose.q
+                if hasattr(q, 'cpu'):
+                    return q[0].cpu().numpy()
+                return _np.array(q)
+        return _np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion
+
+
+class _BodyXposProxy:
+    """body_xpos[idx] → object position from SAPIEN actors."""
+    def __init__(self, env):
+        self._env = env
+
+    def __getitem__(self, idx):
+        env = self._env
+        if env is None:
+            return np.zeros(3)
+        scene_idx = getattr(env, '_scene_idx_to_be_loaded', 0)
+        actors = list(env.object_actors[scene_idx].values())
+        if isinstance(idx, int) and 0 <= idx < len(actors):
+            actor = actors[idx]["actor"]
+            p = actor.pose.p
+            if hasattr(p, 'cpu'):
+                return p[0].cpu().numpy()
+            return np.array(p)
+        return np.zeros(3)
+
+
+class _QposProxy:
+    """sim.data.qpos[joint_id] → 0.0 fallback."""
+    def __init__(self, env):
+        self._env = env
+
+    def __getitem__(self, idx):
+        return 0.0

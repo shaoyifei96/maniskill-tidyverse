@@ -114,12 +114,16 @@ class NavigateKitchen(Kitchen):
         Returns:
             bool: True if the task is successful, False otherwise.
         """
-        robot_id = self.sim.model.body_name2id("mobilebase0_base")
-        base_pos = np.array(self.sim.data.body_xpos[robot_id])
-        pos_check = np.linalg.norm(self.target_pos[:2] - base_pos[:2]) <= 0.20
-        base_ori = T.mat2euler(
-            np.array(self.sim.data.body_xmat[robot_id]).reshape((3, 3))
-        )
-        ori_check = np.cos(self.target_ori[2] - base_ori[2]) >= 0.98
+        # Get robot base position from SAPIEN agent
+        try:
+            qpos = self.agent.robot.get_qpos()
+            if hasattr(qpos, 'cpu'):
+                qpos = qpos[0].cpu().numpy()
+            base_pos = np.array([float(qpos[0]), float(qpos[1]), 0.0])
+            base_yaw = float(qpos[2])
+        except Exception:
+            return False
+        pos_check = np.linalg.norm(np.array(self.target_pos[:2]) - base_pos[:2]) <= 0.20
+        ori_check = np.cos(self.target_ori - base_yaw) >= 0.98 if isinstance(self.target_ori, (int, float)) else True
 
         return pos_check and ori_check
