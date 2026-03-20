@@ -58,6 +58,10 @@ def main():
         except ImportError:
             print("[maniskill] WARNING: camera_server not installed, skipping camera bridge")
 
+    # Always add eval bridge
+    from maniskill_server.eval_bridge import EvalBridge
+    server.add_bridge(EvalBridge(server))
+
     server.run()
 
 

@@ -1,7 +1,7 @@
 """Configuration for the ManiSkill server and bridges."""
 
 # Default environment
-DEFAULT_TASK = "PushCube-v1"
+DEFAULT_TASK = "RoboCasaKitchen-v1"
 DEFAULT_CONTROL_MODE = "whole_body"
 DEFAULT_OBS_MODE = "rgbd"
 

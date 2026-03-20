@@ -407,6 +407,23 @@ class ManiskillServer:
         self._update_state(obs)
         return True
 
+    def _cmd_evaluate(self):
+        """Evaluate current task success via env.evaluate()."""
+        uw = self.env.unwrapped
+        if hasattr(uw, 'evaluate'):
+            return uw.evaluate()
+        return {"success": False, "error": "env has no evaluate()"}
+
+    def _cmd_get_task_info(self):
+        """Return current task metadata."""
+        uw = self.env.unwrapped
+        return {
+            "task_id": self.task,
+            "task_class": type(uw).__name__,
+            "has_evaluate": hasattr(uw, 'evaluate'),
+            "has_check_success": hasattr(uw, '_check_success'),
+        }
+
     # -- Init & main loop --------------------------------------------------
 
     def _init_env(self):
@@ -415,6 +432,10 @@ class ManiskillServer:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import tidyverse_agent  # noqa: registers 'tidyverse'
         import mani_skill.envs   # noqa: registers envs
+        try:
+            import robocasa_tasks  # noqa: registers RoboCasa-* envs
+        except ImportError:
+            print("[maniskill] WARNING: robocasa_tasks not found, RoboCasa envs unavailable")
         import gymnasium as gym
 
         render_mode = "human" if self.has_renderer else None
