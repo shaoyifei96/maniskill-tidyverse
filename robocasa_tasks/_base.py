@@ -120,14 +120,18 @@ class Kitchen(RoboCasaKitchenEnv):
             pass
         return False
     
-    def get_fixture(self, fixture_id, ref=None, ref_fixture=None):
+    def get_fixture(self, fixture_id=None, ref=None, ref_fixture=None, id=None, size=None):
         """Get a fixture by id (compatibility with RoboCasa API).
         
         Args:
-            fixture_id: FixtureType or string id
+            fixture_id: FixtureType or string id (positional)
+            id: same as fixture_id (keyword form used by some tasks)
             ref: optional reference fixture for proximity search
             ref_fixture: alias for ref
+            size: minimum size for counter fixtures
         """
+        if id is not None and fixture_id is None:
+            fixture_id = id
         scene_idx = getattr(self, '_scene_idx_to_be_loaded', 0)
         # Delegate to scene builder if possible
         if hasattr(self, 'scene_builder') and self.scene_builder is not None:
