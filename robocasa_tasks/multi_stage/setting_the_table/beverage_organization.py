@@ -28,16 +28,23 @@ class BeverageOrganization(Kitchen):
             self.counter = self.fixture_refs["counter"]
             self.dining_table = self.fixture_refs["dining_table"]
         else:
-
-            self.dining_table = self.register_fixture_ref(
-                "dining_table",
-                dict(id=FixtureType.COUNTER, ref=FixtureType.STOOL, size=(0.75, 0.2)),
-            )
+            try:
+                self.dining_table = self.register_fixture_ref(
+                    "dining_table",
+                    dict(id=FixtureType.COUNTER, ref=FixtureType.STOOL, size=(0.75, 0.2)),
+                )
+            except (KeyError, AssertionError, ValueError):
+                # No STOOL in scene — just pick any large counter as dining_table
+                self.dining_table = self.register_fixture_ref(
+                    "dining_table",
+                    dict(id=FixtureType.COUNTER, size=(0.75, 0.2)),
+                )
             self.counter = self.get_fixture(id=FixtureType.COUNTER)
-            # do not want to sample the dining table or a counter with a builtin sink
-            # TODO Change later!
-            while self.counter == self.dining_table or "corner" in self.counter.name:
+            # pick a different counter than dining_table
+            attempts = 0
+            while (self.counter == self.dining_table or "corner" in self.counter.name) and attempts < 20:
                 self.counter = self.get_fixture(FixtureType.COUNTER)
+                attempts += 1
             self.fixture_refs["counter"] = self.counter
 
         self.init_robot_base_pos = self.counter
