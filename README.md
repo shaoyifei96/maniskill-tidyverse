@@ -19,6 +19,20 @@ conda activate maniskill
 pip install mani_skill==3.0.0b22 mplib==0.2.1 pycollada
 ```
 
+## Protocol Bridges (optional — for agent_server integration)
+
+To run ManiSkill as a drop-in replacement for real hardware via [agent_server](https://github.com/TidyBot-Services), install the protocol bridge drivers from the [TidyBot-Services org](https://github.com/orgs/TidyBot-Services/repositories?q=mirror%3Afalse+fork%3Afalse+archived%3Afalse):
+
+```bash
+pip install git+https://github.com/TidyBot-Services/maniskill_server.git
+pip install git+https://github.com/TidyBot-Services/arm_franka_maniskill_service.git
+pip install git+https://github.com/TidyBot-Services/gripper_robotiq_maniskill_service.git
+pip install git+https://github.com/TidyBot-Services/base_tidybot_maniskill_service.git
+pip install git+https://github.com/TidyBot-Services/camera_realsense_maniskill_service.git
+```
+
+Then start the sim server: `python -m maniskill_server --gui`
+
 ## Setup
 
 ```bash
