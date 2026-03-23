@@ -152,6 +152,40 @@ class TidyVerse(BaseAgent):
     base_force_limit = 600
 
     @property
+    def _sensor_configs(self):
+        return [
+            # Wrist camera: mounted on panda_link8, panda_v3 realsense orientation
+            CameraConfig(
+                uid="wrist_camera",
+                pose=sapien.Pose(
+                    p=[0.1, 0.0, 0.05],  # offset in x + slightly forward from link8
+                    q=[0, 0.7071, 0, 0.7071],
+                ),
+                width=512,
+                height=512,
+                fov=100 * np.pi / 180,
+                near=0.01,
+                far=5.0,
+                mount=self.robot.links_map["panda_link8"],
+            ),
+            # Base camera: mounted on base_link, head height, identity orientation
+            CameraConfig(
+                uid="base_camera",
+                pose=sapien.Pose(
+                    p=[0.0, 0.15, 1.5],
+                    # Pitch down ~15°: rotate around y-axis in mount frame
+                    q=[np.cos(0.13), 0, np.sin(0.13), 0],
+                ),
+                width=512,
+                height=512,
+                fov=100 * np.pi / 180,
+                near=0.01,
+                far=10.0,
+                mount=self.robot.links_map["base_link"],
+            ),
+        ]
+
+    @property
     def _controller_configs(self):
         # ---- Arm controllers ----
         arm_pd_joint_pos = PDJointPosControllerConfig(
