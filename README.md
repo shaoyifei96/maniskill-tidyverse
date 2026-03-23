@@ -359,7 +359,49 @@ Typically finds 40+ placement locations per kitchen layout.
 
 ### Collision handling caveat
 
-The ACM (Allowed Collision Matrix) is relaxed for **all** kitchen fixtures and static geometry so the planner can find paths in the cluttered kitchen. This means the robot will plan paths that may pass through counters, cabinets, and walls. Only collisions with the spawned cubes are checked. Proper collision avoidance against furniture requires either selective ACM relaxation per fixture or adding kitchen geometry as planning obstacles, which is not yet implemented.
+This older script relaxes **all** kitchen fixtures in the ACM so the planner ignores furniture entirely. See `test_perception_grasp.py` for the improved approach with fixture AABB boxes and dual-radius ACM.
+
+## Perception-Based Grasp Pipeline
+
+`test_perception_grasp.py` — uses depth + segmentation cameras to detect objects, then plans and executes grasps with wrist-camera refinement. Modular: split across `perception.py`, `grasp_strategies.py`, `planning_utils.py`, and `execution.py`.
+
+```bash
+# Headless — record video
+python test_perception_grasp.py --render rgb_array --seed 0 --spawn-test-objects
+
+# With obstacle map snapshots (saved as .glb)
+python test_perception_grasp.py --render rgb_array --seed 0 --spawn-test-objects --viz-dir perception_viz
+
+# Limit objects
+python test_perception_grasp.py --render rgb_array --seed 0 --spawn-test-objects --max-objects 3
+```
+
+### Pipeline stages
+
+1. **Perceive** — base camera RGB+depth+segmentation → back-project to 3D world frame → bbox midpoint center estimation (~5mm accuracy vs ground truth)
+2. **Strategy selection** — TopDown + Angled45, each at 3 yaw angles (base→object direction, ±30°) = 6 candidates per object
+3. **Pre-grasp IK** — solve IK for 8cm above target; tries arm-only then whole-body, with 180° gripper flip fallback
+4. **Plan to pre-grasp** — whole-body collision-aware path via mplib RRT
+5. **Base tracking check** — verify base reached planned position (< 10cm error), skip if stuck
+6. **Wrist re-perception** — re-detect target with wrist camera at pre-grasp position (~30mm refinement)
+7. **Approach** — plan to refined grasp pose
+8. **Grasp → Lift → Transport → Drop → Return home**
+
+### Obstacle handling
+
+Kitchen fixtures are approximated as **AABB boxes** added to the mplib planning world (FCL objects). These boxes are planning-only — they do not affect SAPIEN physics. The ACM uses a **dual-radius** scheme: objects within 1.5m of the robot start position OR any target position are collision-checked; distant objects are relaxed.
+
+> **Caveat: obstacles are approximate.** The fixture AABB boxes are axis-aligned bounding boxes computed from collision meshes. They over-approximate curved/angled fixtures and may block valid paths near tight spaces. Articulated fixture meshes (cabinet doors, drawers) are relaxed in the ACM due to false-positive collisions — only the AABB boxes represent them. This means the planner does not account for open/closed door states. Proper collision handling would require convex decomposition or using the actual fixture mesh state.
+
+### Modules
+
+| File | Contents |
+|------|----------|
+| `perception.py` | `PerceptionResult`, `deproject_pixels_to_world`, `perceive_objects`, `classify_fixture_context`, `save_perception_debug` |
+| `grasp_strategies.py` | Grasp pose builders (TopDown, Angled45, Front), `choose_grasp_strategy` with yaw variations |
+| `planning_utils.py` | Monkey-patch for Robotiq meshes, AABB computation, `add_fixture_boxes_to_planner`, `build_kitchen_acm`, `resolve_start_collisions` |
+| `execution.py` | Constants, `make_action`, `execute_trajectory`, `attempt_grasp` (full pipeline), 180° flip IK fallback |
+| `viz_planning_world.py` | Export mplib planning world collision meshes to .glb for inspection |
 
 ## Known Limitations
 
@@ -368,15 +410,24 @@ The ACM (Allowed Collision Matrix) is relaxed for **all** kitchen fixtures and s
 - ManiSkill warns `"tidyverse is not in the task's list of supported robots"` — safe to ignore
 - Whole-body planner may choose excessive base yaw rotations (cosmetic — TCP accuracy unaffected)
 - mplib hangs on DAE collision meshes — always use `tidyverse_bare.urdf` for planning
+- **Obstacle approximation:** fixture AABB boxes are coarse — they over-approximate geometry and don't reflect articulated state (open/closed doors). See Perception Pipeline section above.
 
 ## File Structure
 
 ```
 maniskill-tidyverse/
-├── test_robocasa_grasp.py           # Kitchen grasp test (place cubes on all surfaces, pick them up)
-├── test_table_grasp.py              # Table-top grasp test (3 strategies, video recording)
-├── tidyverse_agent.py              # Agent class, registered as 'tidyverse'
-├── tidyverse.urdf                   # Full URDF (for ManiSkill rendering)
+├── test_perception_grasp.py         # Perception-based grasp pipeline (main script)
+├── perception.py                    # Camera perception: depth back-projection, object detection
+├── grasp_strategies.py              # Grasp pose generation and strategy selection
+├── planning_utils.py                # mplib monkey-patch, AABB boxes, ACM builder
+├── execution.py                     # Motion execution, attempt_grasp pipeline
+├── viz_planning_world.py            # Export planning world to .glb
+├── test_robocasa_grasp.py           # Kitchen grasp test (place cubes, pick them up)
+├── test_robocasa_pick_place.py      # Pick-and-place with known object positions
+├── test_table_grasp.py              # Table-top grasp test (3 strategies, video)
+├── debug_perception_offset.py       # Compare ground-truth vs perceived positions
+├── tidyverse_agent.py               # Agent class, registered as 'tidyverse'
+├── tidyverse.urdf                   # Full URDF (ManiSkill rendering)
 ├── tidyverse_bare.urdf              # Planning URDF (box collisions, whole-body)
 ├── tidyverse_arm_planning.urdf      # Planning URDF (base fixed, arm-only)
 ├── tidyverse_bare_mplib.srdf        # Auto-generated SRDF
