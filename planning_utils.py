@@ -231,12 +231,16 @@ def _get_object_position(pw, name):
 
 
 def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
-                      robot_pos=None, near_radius=1.5):
+                      robot_pos=None, target_positions=None, near_radius=1.5):
     """Configure ACM for collision checking.
 
     mode='relaxed': relax ALL fixture collisions (planner ignores furniture).
-    mode='strict':  only relax fixtures far from robot (>near_radius);
-                    nearby fixtures are collision-checked by the planner.
+    mode='strict':  only relax fixtures far from both robot AND all target
+                    positions (>near_radius); nearby fixtures are checked.
+
+    target_positions: list of [x,y,z] positions the robot will travel to
+                      (e.g. grasp targets, sink). Objects near any of these
+                      are kept as collision obstacles.
     """
     acm = pw.get_allowed_collision_matrix()
     art_names = pw.get_articulation_names()
@@ -263,6 +267,13 @@ def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
     obj_names = pw.get_object_names()
     checked_objs = [n for n in obj_names if n in target_set]
 
+    # Build list of reference points: robot start + all target positions
+    ref_points = []
+    if robot_pos is not None:
+        ref_points.append(np.array(robot_pos)[:2])
+    for tp in (target_positions or []):
+        ref_points.append(np.array(tp)[:2])
+
     # Classify static objects
     relaxed_static, checked_static = [], []
     for on in obj_names:
@@ -272,12 +283,13 @@ def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
             relaxed_static.append(on)
         else:
             pos = _get_object_position(pw, on)
-            if pos is not None and robot_pos is not None:
-                dist = np.linalg.norm(pos[:2] - robot_pos[:2])
-                if dist > near_radius:
+            if pos is not None and ref_points:
+                # Near if within near_radius of ANY reference point
+                min_dist = min(np.linalg.norm(pos[:2] - rp) for rp in ref_points)
+                if min_dist > near_radius:
                     relaxed_static.append(on)
                 else:
-                    checked_static.append((on, dist))
+                    checked_static.append((on, min_dist))
             else:
                 checked_static.append((on, -1))
 
@@ -336,3 +348,99 @@ def sync_planner(planner):
         planner.update_from_simulation()
     except Exception:
         pass
+
+
+# ─── Start-state Collision Resolution ────────────────────────────────────────
+
+def check_start_collisions(pw, planner, target_name=None):
+    """Check for start-state collisions, ignoring the target object.
+
+    Returns list of (robot_link, obstacle_name) pairs for non-target collisions.
+    """
+    sync_planner(planner)
+    collisions = pw.check_collision()
+    if not collisions:
+        return []
+
+    robot_link_names = set(planner.pinocchio_model.get_link_names())
+    problems = []
+    for c in collisions:
+        # Identify which side is robot, which is obstacle
+        if c.object_name1 in robot_link_names:
+            robot_link, obstacle = c.link_name1, c.object_name2
+        elif c.object_name2 in robot_link_names:
+            robot_link, obstacle = c.link_name2, c.object_name1
+        else:
+            continue  # self-collision or non-robot — skip
+
+        # Skip collisions with the target object we're trying to grasp
+        if target_name and target_name in obstacle:
+            continue
+
+        problems.append((robot_link, obstacle))
+
+    return problems
+
+
+def resolve_start_collisions(pw, planner, robot, step_fn, target_name=None,
+                             max_attempts=5, nudge_dist=0.05):
+    """Move the base to escape start-state collisions (excluding target object).
+
+    Strategy: compute direction from colliding obstacle to robot base, nudge
+    the base along that direction. Repeat up to max_attempts times.
+
+    Returns True if collision-free (or only target collisions remain).
+    """
+    from execution import make_action, get_robot_qpos, ARM_HOME, GRIPPER_OPEN
+
+    for attempt in range(max_attempts):
+        problems = check_start_collisions(pw, planner, target_name)
+        if not problems:
+            return True
+
+        robot_links, obstacles = zip(*problems)
+        unique_obstacles = set(obstacles)
+        print(f"    Start-state collision (attempt {attempt+1}/{max_attempts}): "
+              f"robot <-> {unique_obstacles}")
+
+        # Get obstacle positions to compute nudge direction
+        robot_pos = robot.pose.p[0].cpu().numpy()[:2]  # xy only
+        nudge_dir = np.zeros(2)
+
+        for obs_name in unique_obstacles:
+            obs_pos = _get_object_position(pw, obs_name)
+            if obs_pos is not None:
+                away = robot_pos - obs_pos[:2]
+                norm = np.linalg.norm(away)
+                if norm > 1e-3:
+                    nudge_dir += away / norm
+
+        norm = np.linalg.norm(nudge_dir)
+        if norm < 1e-3:
+            # No clear direction — try backing up in -x (away from counter)
+            nudge_dir = np.array([-1.0, 0.0])
+        else:
+            nudge_dir /= norm
+
+        # Apply nudge to base qpos
+        qpos = get_robot_qpos(robot)
+        qpos[0] += nudge_dir[0] * nudge_dist
+        qpos[1] += nudge_dir[1] * nudge_dist
+
+        print(f"    Nudging base by [{nudge_dir[0]*nudge_dist:+.3f}, "
+              f"{nudge_dir[1]*nudge_dist:+.3f}]")
+
+        # Execute the nudge
+        hold = make_action(qpos[3:10], GRIPPER_OPEN, qpos[:3])
+        for _ in range(40):
+            step_fn(hold)
+
+        sync_planner(planner)
+
+    # Final check
+    problems = check_start_collisions(pw, planner, target_name)
+    if not problems:
+        return True
+
+    print(f"    Could not resolve start collisions after {max_attempts} attempts")
+    return False

@@ -356,21 +356,6 @@ def main():
                                                       skip_fixtures=skip_set)
     print(f"  Added {len(fixture_box_names)} fixture boxes to planning world")
 
-    # ACM — keep collision checking for perceived objects
-    target_names = {p.name for p in perceptions}
-    t0 = time.time()
-    build_kitchen_acm(pw, planner, target_names, mode=args.acm,
-                      robot_pos=arm_base)
-    t_acm = time.time() - t0
-    print(f"  ACM build: {t_acm:.2f}s")
-
-    # --- Save obstacle map snapshots ---
-    if args.viz_dir:
-        os.makedirs(args.viz_dir, exist_ok=True)
-        sync_planner(planner)
-        save_planning_world(pw, os.path.join(args.viz_dir, "planning_world_all"))
-        print(f"  Full planning world saved to {args.viz_dir}/planning_world_all.glb")
-
     # --- Find sink for placement ---
     from mani_skill.utils.scene_builder.robocasa.fixtures.sink import Sink
     sink_pos = None
@@ -392,6 +377,25 @@ def main():
     else:
         drop_pos = None
         print("\n  WARNING: No sink found — will drop in place")
+
+    # ACM — keep collision checking for perceived objects
+    # Use robot start + all grasp targets + sink as reference points
+    target_names = {p.name for p in perceptions}
+    target_positions = [p.center_3d for p in perceptions]
+    if drop_pos is not None:
+        target_positions.append(drop_pos)
+    t0 = time.time()
+    build_kitchen_acm(pw, planner, target_names, mode=args.acm,
+                      robot_pos=arm_base, target_positions=target_positions)
+    t_acm = time.time() - t0
+    print(f"  ACM build: {t_acm:.2f}s")
+
+    # --- Save obstacle map snapshots ---
+    if args.viz_dir:
+        os.makedirs(args.viz_dir, exist_ok=True)
+        sync_planner(planner)
+        save_planning_world(pw, os.path.join(args.viz_dir, "planning_world_all"))
+        print(f"  Full planning world saved to {args.viz_dir}/planning_world_all.glb")
 
     # --- Grasp loop ---
     timings = {'ik': 0.0, 'planning': 0.0, 'exec': 0.0,

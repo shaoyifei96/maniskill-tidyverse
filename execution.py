@@ -7,10 +7,15 @@ import numpy as np
 import torch
 
 from mplib import Pose as MPPose
+from transforms3d.quaternions import qmult
 
 from perception import perceive_objects
-from planning_utils import sync_planner
+from planning_utils import sync_planner, resolve_start_collisions
 from viz_planning_world import save_planning_world
+
+# 180° rotation around gripper approach axis (local z) — swaps finger sides
+# Mechanically identical grasp but different arm joint configuration
+Q_FLIP_Z = np.array([0.0, 0.0, 0.0, 1.0])  # wxyz: 180° around z
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -19,7 +24,7 @@ ARM_HOME = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.913, 0.785])
 GRIPPER_OPEN = 0.0
 GRIPPER_CLOSED = 0.81
 PRE_GRASP_HEIGHT = 0.08
-LIFT_HEIGHT = 0.15
+LIFT_HEIGHT = 0.06
 
 MASK_ARM_ONLY  = np.array([True] * 3 + [False] * 7 + [True] * 6)
 MASK_WHOLE_BODY = np.array([False] * 3 + [False] * 7 + [True] * 6)
@@ -125,41 +130,57 @@ def attempt_grasp(perception, strategies, robot, planner, pw, step_fn,
 
         pre_pose = MPPose(p=target_p + [0, 0, PRE_GRASP_HEIGHT], q=target_q)
 
+        # 0. Resolve start-state collisions (nudge base if needed)
         sync_planner(planner)
+        resolve_start_collisions(pw, planner, robot, step_fn,
+                                 target_name=perception.name)
         cq = get_robot_qpos(robot)
 
-        # 1. Solve pre-grasp IK
-        pre_base = planner._transform_goal_to_wrt_base(pre_pose)
+        # 1. Solve pre-grasp IK (try original, then 180°-flipped orientation)
         pregrasp_sols = None
         grasp_mask = None
-        for mask_name, mask in [("arm-only", MASK_ARM_ONLY),
-                                ("whole-body", MASK_WHOLE_BODY)]:
-            t0 = time.time()
-            signal.alarm(IK_TIMEOUT)
-            try:
-                status, solutions = planner.IK(
-                    pre_base, cq, mask=mask, n_init_qpos=40,
-                    return_closest=True)
-            except TimeoutError:
-                dt = time.time() - t0
-                print(f"    Pre-grasp IK ({mask_name}): TIMEOUT  [{dt:.2f}s]")
-                timings['ik'] += dt
-                continue
-            finally:
-                signal.alarm(0)
-            dt = time.time() - t0
-            timings['ik'] += dt
-            if solutions is not None:
-                pregrasp_sols = solutions
-                grasp_mask = mask
-                print(f"    Pre-grasp IK ({mask_name}): OK  [{dt:.2f}s]")
+        used_flip = False
+        for flip_label, q_used in [("", target_q),
+                                    ("flip180", qmult(target_q, Q_FLIP_Z))]:
+            if pregrasp_sols is not None:
                 break
-            else:
-                print(f"    Pre-grasp IK ({mask_name}): no solution  [{dt:.2f}s]")
+            cur_pre_pose = MPPose(p=target_p + [0, 0, PRE_GRASP_HEIGHT], q=q_used)
+            pre_base = planner._transform_goal_to_wrt_base(cur_pre_pose)
+            for mask_name, mask in [("arm-only", MASK_ARM_ONLY),
+                                    ("whole-body", MASK_WHOLE_BODY)]:
+                suffix = f"+{flip_label}" if flip_label else ""
+                t0 = time.time()
+                signal.alarm(IK_TIMEOUT)
+                try:
+                    status, solutions = planner.IK(
+                        pre_base, cq, mask=mask, n_init_qpos=40,
+                        return_closest=True)
+                except TimeoutError:
+                    dt = time.time() - t0
+                    print(f"    Pre-grasp IK ({mask_name}{suffix}): TIMEOUT  [{dt:.2f}s]")
+                    timings['ik'] += dt
+                    continue
+                finally:
+                    signal.alarm(0)
+                dt = time.time() - t0
+                timings['ik'] += dt
+                if solutions is not None:
+                    pregrasp_sols = solutions
+                    grasp_mask = mask
+                    if flip_label:
+                        target_q = q_used  # use flipped orientation for rest of pipeline
+                        pre_pose = cur_pre_pose
+                        used_flip = True
+                    print(f"    Pre-grasp IK ({mask_name}{suffix}): OK  [{dt:.2f}s]")
+                    break
+                else:
+                    print(f"    Pre-grasp IK ({mask_name}{suffix}): no solution  [{dt:.2f}s]")
 
         if pregrasp_sols is None:
             print(f"    Pre-grasp IK: FAILED for {strategy_name}")
             continue
+        if used_flip:
+            print(f"    Using 180°-flipped gripper orientation")
 
         # 2. Plan path: current -> pre-grasp
         sync_planner(planner)
@@ -341,6 +362,8 @@ def attempt_grasp(perception, strategies, robot, planner, pw, step_fn,
             drop_q = np.array([0, 1, 0, 0], dtype=float)  # top-down
             drop_pose = MPPose(p=drop_pos, q=drop_q)
             sync_planner(planner)
+            resolve_start_collisions(pw, planner, robot, step_fn,
+                                     target_name=perception.name)
             cq = get_robot_qpos(robot)
             _snap("sink_plan")
             t0 = time.time()
@@ -379,6 +402,8 @@ def attempt_grasp(perception, strategies, robot, planner, pw, step_fn,
 
         # 8. Return to home
         sync_planner(planner)
+        resolve_start_collisions(pw, planner, robot, step_fn,
+                                 target_name=perception.name)
         cq = get_robot_qpos(robot)
         _snap("return_plan")
         home_qpos = cq.copy()
