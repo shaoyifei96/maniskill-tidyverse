@@ -1,5 +1,6 @@
-"""Planner setup: mplib monkey-patch, ACM builder, sync helper."""
+"""Motion planning utilities: monkey-patch, AABB computation, fixture boxes, ACM builder."""
 import numpy as np
+import sapien
 
 from mplib import Pose as MPPose
 from mplib.sapien_utils import SapienPlanningWorld
@@ -15,6 +16,8 @@ from sapien.physx import (
 )
 from transforms3d.euler import euler2quat
 import mplib.sapien_utils.conversion as _conv
+
+from mani_skill.utils.scene_builder.robocasa.fixtures.others import Floor, Wall
 
 
 # ─── Monkey-patch: apply scale to Robotiq convex collision meshes ─────────────
@@ -61,71 +64,209 @@ def _convert_physx_component(comp):
 SapienPlanningWorld.convert_physx_component = _convert_physx_component
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── AABB Computation ────────────────────────────────────────────────────────
 
-def sync_planner(planner):
-    try:
-        planner.update_from_simulation()
-    except Exception:
-        pass
+def _shape_aabb_corners(shape, shape_T):
+    """Get world-frame corners/extremes of a collision shape for AABB computation."""
+    pts = []
+    if isinstance(shape, PhysxCollisionShapeBox):
+        hs = np.array(shape.half_size)
+        for sx in [-1, 1]:
+            for sy in [-1, 1]:
+                for sz in [-1, 1]:
+                    local = np.array([sx * hs[0], sy * hs[1], sz * hs[2]])
+                    pts.append(shape_T[:3, :3] @ local + shape_T[:3, 3])
+    elif isinstance(shape, PhysxCollisionShapeConvexMesh):
+        verts = shape.vertices
+        if not np.allclose(shape.scale, 1.0):
+            verts = verts * np.array(shape.scale)
+        pts_w = (shape_T[:3, :3] @ verts.T).T + shape_T[:3, 3]
+        pts.extend(pts_w)
+    elif isinstance(shape, PhysxCollisionShapeTriangleMesh):
+        verts = shape.vertices
+        pts_w = (shape_T[:3, :3] @ verts.T).T + shape_T[:3, 3]
+        pts.extend(pts_w)
+    elif isinstance(shape, PhysxCollisionShapeSphere):
+        c = shape_T[:3, 3]
+        r = shape.radius
+        for axis in range(3):
+            for sign in [-1, 1]:
+                p = c.copy()
+                p[axis] += sign * r
+                pts.append(p)
+    elif isinstance(shape, (PhysxCollisionShapeCapsule, PhysxCollisionShapeCylinder)):
+        c = shape_T[:3, 3]
+        r = shape.radius
+        hl = shape.half_length
+        local_axis = shape_T[:3, 0]
+        for end in [-hl, hl]:
+            center = c + local_axis * end
+            for ax in range(3):
+                for sign in [-1, 1]:
+                    p = center.copy()
+                    p[ax] += sign * r
+                    pts.append(p)
+    return pts
 
+
+def compute_articulation_aabb(scene_art):
+    """Compute world-frame AABB of a SAPIEN articulation from collision shapes."""
+    all_pts = []
+    for link in scene_art.get_links():
+        link_T = link.pose.to_transformation_matrix()
+        for shape in link.collision_shapes:
+            local_T = shape.local_pose.to_transformation_matrix()
+            shape_T = link_T @ local_T
+            pts = _shape_aabb_corners(shape, shape_T)
+            all_pts.extend(pts)
+    if not all_pts:
+        return None, None
+    all_pts = np.array(all_pts)
+    return all_pts.min(axis=0), all_pts.max(axis=0)
+
+
+def _compute_fixture_aabb(scene, fname):
+    """Compute world-frame AABB for a fixture by checking articulations then static actors."""
+    scene_arts = {a.name: a for a in scene.get_all_articulations()}
+
+    # Try articulations first
+    for art_name, art in scene_arts.items():
+        if fname.replace(' ', '_') in art_name or fname in art_name:
+            return compute_articulation_aabb(art)
+
+    # Try fuzzy match on articulations
+    fname_parts = fname.replace(' ', '_').split('_')
+    for art_name, art in scene_arts.items():
+        art_lower = art_name.lower()
+        if all(part.lower() in art_lower for part in fname_parts if len(part) > 2):
+            return compute_articulation_aabb(art)
+
+    # Try static actors
+    for actor in scene.get_all_actors():
+        if fname.replace(' ', '_') in actor.name or fname in actor.name:
+            all_pts = []
+            actor_T = actor.pose.to_transformation_matrix()
+            comp = actor.find_component_by_type(
+                sapien.physx.PhysxRigidStaticComponent
+            ) or actor.find_component_by_type(
+                sapien.physx.PhysxRigidDynamicComponent
+            )
+            if comp is None:
+                return None, None
+            for shape in comp.collision_shapes:
+                local_T = shape.local_pose.to_transformation_matrix()
+                shape_T = actor_T @ local_T
+                pts = _shape_aabb_corners(shape, shape_T)
+                all_pts.extend(pts)
+            if all_pts:
+                all_pts_arr = np.array(all_pts)
+                return all_pts_arr.min(axis=0), all_pts_arr.max(axis=0)
+            return None, None
+
+    return None, None
+
+
+# ─── Fixture Boxes ───────────────────────────────────────────────────────────
+
+def add_fixture_boxes_to_planner(pw, scene, fixtures_dict, skip_fixtures=None):
+    """Add AABB box approximations of fixtures directly to the mplib planning world.
+
+    These boxes are added as FCL objects to the planning world only — they do NOT
+    affect SAPIEN physics. The original fixture meshes should be relaxed in the ACM.
+
+    skip_fixtures: set of fixture names to skip (e.g. sink for drop target)
+    """
+    skip_fixtures = skip_fixtures or set()
+    box_names = []
+    for fname, fix in fixtures_dict.items():
+        if isinstance(fix, (Floor, Wall)):
+            continue
+        if not hasattr(fix, 'pos'):
+            continue
+        if fname in skip_fixtures:
+            continue
+
+        bbox_min, bbox_max = _compute_fixture_aabb(scene, fname)
+
+        # Fallback only: use fixture pos+size when no collision AABB found
+        if bbox_min is None and hasattr(fix, 'size') and fix.size is not None:
+            pos = np.array(fix.pos)
+            size = np.array(fix.size)
+            if len(size) == 3 and np.all(size > 0.01):
+                fix_half = size / 2.0
+                bbox_min = pos - fix_half
+                bbox_max = pos + fix_half
+
+        if bbox_min is None:
+            continue
+
+        center = (bbox_min + bbox_max) / 2.0
+        half_size = (bbox_max - bbox_min) / 2.0
+
+        # Skip tiny or degenerate boxes
+        if np.any(half_size < 0.005) or np.any(half_size > 5.0):
+            continue
+
+        box_name = f"fixture_box_{fname}"
+        try:
+            box_geom = Box(side=half_size * 2)
+            shape = CollisionObject(box_geom)
+            fcl_obj = FCLObject(box_name, MPPose(p=center), [shape], [MPPose()])
+            pw.add_object(fcl_obj)
+            box_names.append(box_name)
+        except Exception as e:
+            print(f"    Failed to add box for {fname}: {e}")
+
+    return box_names
+
+
+# ─── ACM Builder ─────────────────────────────────────────────────────────────
 
 def _get_object_position(pw, name):
+    """Get the world position of a planning-world object."""
     try:
         return np.array(pw.get_object(name).pose.p)
     except Exception:
         return None
 
 
-# ─── ACM builder ─────────────────────────────────────────────────────────────
+def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
+                      robot_pos=None, near_radius=1.5):
+    """Configure ACM for collision checking.
 
-def build_kitchen_acm(pw, planner, cube_names, mode='relaxed',
-                      robot_pos=None, near_radius=3.0):
+    mode='relaxed': relax ALL fixture collisions (planner ignores furniture).
+    mode='strict':  only relax fixtures far from robot (>near_radius);
+                    nearby fixtures are collision-checked by the planner.
+    """
     acm = pw.get_allowed_collision_matrix()
     art_names = pw.get_articulation_names()
     robot_link_names = planner.pinocchio_model.get_link_names()
     robot_art = next(n for n in art_names if 'tidyverse' in n.lower())
 
+    target_set = set(target_names or [])
+
+    # --- Log what the planner sees ---
     print(f"\n  Planning world contents (ACM mode={mode}):")
     print(f"    Robot links ({len(robot_link_names)}): {robot_link_names[:5]}...")
     print(f"    Articulations ({len(art_names)}):")
 
-    # Classify articulations by distance
-    relaxed_arts, checked_arts = [], []
     for an in art_names:
         if an == robot_art:
             print(f"      [ROBOT] {an}")
             continue
         fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
         if mode == 'relaxed':
-            relaxed_arts.append(an)
             print(f"      [RELAXED] {an} ({len(fl)} links)")
         else:
-            art = pw.get_articulation(an)
-            fcl_model = art.get_fcl_model()
-            col_objs = fcl_model.get_collision_objects()
-            art_pos = None
-            if col_objs:
-                art_pos = np.array(col_objs[0].pose.p)
-            if art_pos is not None and robot_pos is not None:
-                dist = np.linalg.norm(art_pos[:2] - robot_pos[:2])
-                if dist > near_radius:
-                    relaxed_arts.append(an)
-                    print(f"      [RELAXED] {an} ({len(fl)} links)  dist={dist:.2f}m")
-                else:
-                    checked_arts.append((an, dist))
-                    print(f"      [CHECKED] {an} ({len(fl)} links)  dist={dist:.2f}m")
-            else:
-                checked_arts.append((an, -1))
-                print(f"      [CHECKED] {an} ({len(fl)} links)  dist=unknown")
+            print(f"      [PENDING] {an} ({len(fl)} links)")
 
     obj_names = pw.get_object_names()
-    checked_objs = [n for n in obj_names if n in cube_names]
+    checked_objs = [n for n in obj_names if n in target_set]
 
-    # Classify static objects by distance
+    # Classify static objects
     relaxed_static, checked_static = [], []
     for on in obj_names:
-        if on in cube_names:
+        if on in target_set:
             continue
         if mode == 'relaxed':
             relaxed_static.append(on)
@@ -141,49 +282,57 @@ def build_kitchen_acm(pw, planner, cube_names, mode='relaxed',
                 checked_static.append((on, -1))
 
     print(f"    Static objects ({len(obj_names)} total):")
-    print(f"      Cubes (always checked): {len(checked_objs)}")
-    if mode == 'strict':
-        print(f"      Collision-checked arts (near): {len(checked_arts)}")
-        print(f"      Collision-checked static (near, <{near_radius}m): {len(checked_static)}")
+    print(f"      Targets (always checked): {len(checked_objs)}")
+    if mode == 'relaxed':
+        print(f"      ACM-relaxed: {len(relaxed_static)}")
+    else:
+        print(f"      Collision-checked (near, <{near_radius}m): {len(checked_static)}")
         for on, d in sorted(checked_static, key=lambda x: x[1]):
             print(f"        - {on}  dist={d:.2f}m")
-    print(f"      ACM-relaxed arts: {len(relaxed_arts)}")
-    print(f"      ACM-relaxed static: {len(relaxed_static)}")
+        print(f"      ACM-relaxed (far): {len(relaxed_static)}")
 
-    # Apply ACM — only relax far objects
-    for an in relaxed_arts:
-        fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
-        for rl in robot_link_names:
-            for f in fl:
-                acm.set_entry(rl, f, True)
-    for on in relaxed_static:
-        for rl in robot_link_names:
-            acm.set_entry(rl, on, True)
+    # --- Apply ACM ---
+    if mode == 'relaxed':
+        for an in art_names:
+            if an == robot_art:
+                continue
+            fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
+            for rl in robot_link_names:
+                for f in fl:
+                    acm.set_entry(rl, f, True)
+        for on in relaxed_static:
+            for rl in robot_link_names:
+                acm.set_entry(rl, on, True)
+    else:
+        # Strict: relax fixture articulations (too many false collisions
+        # from articulated fixture meshes), but keep nearby static objects
+        for an in art_names:
+            if an == robot_art:
+                continue
+            fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
+            for rl in robot_link_names:
+                for f in fl:
+                    acm.set_entry(rl, f, True)
+        for on in relaxed_static:
+            for rl in robot_link_names:
+                acm.set_entry(rl, on, True)
 
-    # Resolve initial collisions
+    # Check initial collisions
     sync_planner(planner)
     collisions = pw.check_collision()
-    init_relaxed = []
     if collisions:
         print(f"\n  Initial planner collisions ({len(collisions)}):")
         for c in collisions:
             print(f"    {c.link_name1}({c.object_name1}) <-> "
                   f"{c.link_name2}({c.object_name2})")
-            for obj_name in [c.object_name1, c.object_name2]:
-                if obj_name and obj_name not in cube_names:
-                    if not any('tidyverse' in obj_name.lower() for _ in [1]):
-                        for rl in robot_link_names:
-                            acm.set_entry(rl, obj_name, True)
-                        init_relaxed.append(obj_name)
-        if init_relaxed:
-            print(f"    Auto-relaxed {len(set(init_relaxed))} objects")
-            sync_planner(planner)
     else:
-        print(f"\n  No initial planner collisions")
+        print("\n  No initial collisions.")
 
-    n_checked_s = len(checked_static) - len(set(init_relaxed))
-    print(f"\n  ACM summary: {len(relaxed_arts)} arts relaxed, "
-          f"{len(checked_arts)} arts checked, "
-          f"{len(relaxed_static)} static relaxed, "
-          f"{max(0, n_checked_s)} static checked, "
-          f"{len(checked_objs)} cubes checked")
+
+# ─── Planner Sync ────────────────────────────────────────────────────────────
+
+def sync_planner(planner):
+    try:
+        planner.update_from_simulation()
+    except Exception:
+        pass
