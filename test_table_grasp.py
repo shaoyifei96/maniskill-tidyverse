@@ -8,7 +8,6 @@ import cv2
 import sapien
 import gymnasium as gym
 
-sys.path.insert(0, os.path.dirname(__file__))
 import maniskill_tidyverse.tidyverse_agent  # noqa: F401 — registers 'tidyverse' robot
 import mani_skill.envs  # noqa: F401 — registers ManiSkill envs
 

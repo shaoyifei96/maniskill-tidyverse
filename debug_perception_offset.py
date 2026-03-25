@@ -2,7 +2,6 @@
 import os, sys, numpy as np, torch, gymnasium as gym
 
 # Register agent
-sys.path.insert(0, os.path.dirname(__file__))
 import maniskill_tidyverse.tidyverse_agent  # noqa: F401
 from mani_skill.utils import common
 

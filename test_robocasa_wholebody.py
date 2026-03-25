@@ -3,7 +3,6 @@
 import sys, os, signal, time
 import numpy as np
 import torch, sapien
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def timeout_handler(signum, frame): raise TimeoutError("timeout")
 signal.signal(signal.SIGALRM, timeout_handler)

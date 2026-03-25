@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Perceive a drawer handle, approach with front grasp, close gripper, pull open."""
 import sys, os, signal, numpy as np, torch, cv2, sapien
-sys.path.insert(0, '.')
 import maniskill_tidyverse.tidyverse_agent, mani_skill.envs, gymnasium as gym
 import maniskill_tidyverse.planning_utils  # monkey-patch
 from mplib.sapien_utils import SapienPlanner, SapienPlanningWorld

@@ -19,7 +19,6 @@ import numpy as np
 import torch, sapien, cv2
 import gymnasium as gym
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import maniskill_tidyverse.tidyverse_agent   # noqa: F401 — registers 'tidyverse'
 import mani_skill.envs    # noqa: F401 — registers envs
 

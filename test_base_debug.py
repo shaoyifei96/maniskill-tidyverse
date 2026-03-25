@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Debug script: print base pose and controller target every few steps, save video."""
 import sys, os, numpy as np, torch, cv2
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import maniskill_tidyverse.tidyverse_agent
 import mani_skill.envs
 import gymnasium as gym

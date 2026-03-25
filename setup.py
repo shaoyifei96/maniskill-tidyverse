@@ -14,5 +14,13 @@ setup(
     ],
     package_data={"": ["*.urdf", "*.srdf", "*.glb", "*.dae", "*.stl"]},
     include_package_data=True,
-    install_requires=["mani_skill"],
+    install_requires=[
+        "mani_skill",
+        "torch",
+        "numpy",
+        "mplib>=0.2.0",
+        "transforms3d",
+        "opencv-python",
+        "pytorch_kinematics",
+    ],
 )
