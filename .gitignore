@@ -11,3 +11,8 @@ gripper_robotiq_maniskill_service/
 base_tidybot_maniskill_service/
 camera_realsense_maniskill_service/
 maniskill_server/
+# Machine-specific mesh symlinks (created by setup.sh)
+franka_description
+realsense2_description
+robotiq_meshes
+*.egg-info/
