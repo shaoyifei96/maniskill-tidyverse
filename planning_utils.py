@@ -168,13 +168,18 @@ def _compute_fixture_aabb(scene, fname):
 
 # ─── Fixture Boxes ───────────────────────────────────────────────────────────
 
-def add_fixture_boxes_to_planner(pw, scene, fixtures_dict, skip_fixtures=None):
+def add_fixture_boxes_to_planner(pw, scene, fixtures_dict, skip_fixtures=None,
+                                  cuboids_out=None):
     """Add AABB box approximations of fixtures directly to the mplib planning world.
 
     These boxes are added as FCL objects to the planning world only — they do NOT
     affect SAPIEN physics. The original fixture meshes should be relaxed in the ACM.
 
-    skip_fixtures: set of fixture names to skip (e.g. sink for drop target)
+    Args:
+        skip_fixtures: set of fixture names to skip (e.g. sink for drop target)
+        cuboids_out: optional list to populate with cuboid dicts
+            {"name", "center", "half_size"} — lets caller reuse the AABB data
+            without re-querying SAPIEN scene (which can perturb mplib state).
     """
     skip_fixtures = skip_fixtures or set()
     box_names = []
@@ -214,6 +219,12 @@ def add_fixture_boxes_to_planner(pw, scene, fixtures_dict, skip_fixtures=None):
             fcl_obj = FCLObject(box_name, MPPose(p=center), [shape], [MPPose()])
             pw.add_object(fcl_obj)
             box_names.append(box_name)
+            if cuboids_out is not None:
+                cuboids_out.append({
+                    "name": f"fixture_{fname}",
+                    "center": center.tolist(),
+                    "half_size": half_size.tolist(),
+                })
         except Exception as e:
             print(f"    Failed to add box for {fname}: {e}")
 
@@ -237,6 +248,9 @@ def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
     mode='relaxed': relax ALL fixture collisions (planner ignores furniture).
     mode='strict':  only relax fixtures far from both robot AND all target
                     positions (>near_radius); nearby fixtures are checked.
+    mode='arm_relaxed': like strict, but only checks base-fixture collisions;
+                        arm links can pass through fixtures (for reaching
+                        through/over counters to doors, etc.)
 
     target_positions: list of [x,y,z] positions the robot will travel to
                       (e.g. grasp targets, sink). Objects near any of these
@@ -304,6 +318,12 @@ def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
         print(f"      ACM-relaxed (far): {len(relaxed_static)}")
 
     # --- Apply ACM ---
+    # Identify base vs arm links for arm_relaxed mode
+    base_link_keywords = ['base_link', 'base_x', 'base_y', 'base_yaw']
+    base_links = [rl for rl in robot_link_names
+                  if any(kw in rl.lower() for kw in base_link_keywords)]
+    arm_links = [rl for rl in robot_link_names if rl not in base_links]
+
     if mode == 'relaxed':
         for an in art_names:
             if an == robot_art:
@@ -315,6 +335,27 @@ def build_kitchen_acm(pw, planner, target_names=None, mode='relaxed',
         for on in relaxed_static:
             for rl in robot_link_names:
                 acm.set_entry(rl, on, True)
+    elif mode == 'arm_relaxed':
+        # Hybrid: relax arm-fixture collisions, keep base-fixture collisions
+        # This allows arm to plan through counters while base stays reachable
+        print(f"    arm_relaxed mode: {len(base_links)} base links, {len(arm_links)} arm links")
+        for an in art_names:
+            if an == robot_art:
+                continue
+            fl = pw.get_articulation(an).get_pinocchio_model().get_link_names()
+            for rl in robot_link_names:
+                for f in fl:
+                    acm.set_entry(rl, f, True)  # relax all articulated fixtures
+        # For static objects: relax arm links, check base links
+        for on in relaxed_static:
+            for rl in robot_link_names:
+                acm.set_entry(rl, on, True)
+        for on, d in checked_static:
+            # Arm links: relax (allow arm through counter)
+            for rl in arm_links:
+                acm.set_entry(rl, on, True)
+            # Base links: keep checked (base can't go through counter)
+            # (don't set ACM entry = collision stays enabled)
     else:
         # Strict: relax fixture articulations (too many false collisions
         # from articulated fixture meshes), but keep nearby static objects
