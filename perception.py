@@ -90,6 +90,45 @@ def deproject_pixels_to_world(pixels_uv, depth_img, intrinsic, cam2world_gl):
     return pts_world
 
 
+def _build_config_name_to_category(env):
+    """Build mapping from config names (e.g. 'obj') to category names (e.g. 'mug_0').
+
+    Uses object_cfgs which stores the sampled object info including the real
+    category. Deduplicates by appending _0, _1, etc. for repeated categories.
+
+    Returns:
+        dict: config_name -> semantic_name (e.g. {'obj': 'mug_0', 'distr_counter': 'banana_0'})
+    """
+    scene_idx = getattr(env.unwrapped, '_scene_idx_to_be_loaded', 0)
+    object_cfgs = getattr(env.unwrapped, 'object_cfgs', None)
+    if object_cfgs is None or scene_idx >= len(object_cfgs):
+        return {}
+
+    # First pass: collect categories to know which need dedup suffixes
+    cat_counts = {}
+    entries = []
+    for cfg in object_cfgs[scene_idx]:
+        info = cfg.get("info")
+        if info and "cat" in info:
+            cat = info["cat"]
+            idx = cat_counts.get(cat, 0)
+            cat_counts[cat] = idx + 1
+            entries.append((cfg["name"], cat, idx))
+        else:
+            entries.append((cfg["name"], None, 0))
+
+    # Second pass: only add _N suffix if category appears more than once
+    mapping = {}
+    for config_name, cat, idx in entries:
+        if cat is not None:
+            semantic = f"{cat}_{idx}" if cat_counts[cat] > 1 else cat
+            mapping[config_name] = semantic
+            # MJCFObject.build() appends _{scene_idx} to actor names,
+            # so "obj" becomes "obj_0" in scene 0. Map both forms.
+            mapping[f"{config_name}_{scene_idx}"] = semantic
+    return mapping
+
+
 def perceive_objects(obs, env, camera_name="base_camera",
                      min_pixels=50, max_depth_mm=5000,
                      target_names=None, skip_filter=True):
@@ -101,7 +140,8 @@ def perceive_objects(obs, env, camera_name="base_camera",
         camera_name: which camera to use
         min_pixels: minimum mask area to consider
         max_depth_mm: max depth to consider (ignore far objects)
-        target_names: if set, only detect these object names (skip all others)
+        target_names: if set, only detect these object names (skip all others).
+            Matches against semantic category names (e.g. 'mug', 'mug_0').
 
     Returns:
         list of PerceptionResult
@@ -121,6 +161,9 @@ def perceive_objects(obs, env, camera_name="base_camera",
 
     # Segmentation ID map
     seg_id_map = env.unwrapped.segmentation_id_map
+
+    # Build config name -> semantic category mapping
+    name_to_cat = _build_config_name_to_category(env)
 
     # Robot link names for filtering
     robot_link_names = set()
@@ -144,8 +187,10 @@ def perceive_objects(obs, env, camera_name="base_camera",
         if obj is None:
             continue
 
-        obj_name = obj.name if hasattr(obj, 'name') else str(obj)
-        is_robot = obj_name in robot_link_names
+        raw_name = obj.name if hasattr(obj, 'name') else str(obj)
+        is_robot = raw_name in robot_link_names
+        # Resolve to semantic category name if available
+        obj_name = name_to_cat.get(raw_name, raw_name)
 
         # Skip robot links
         if is_robot:
