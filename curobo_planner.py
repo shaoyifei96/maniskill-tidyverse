@@ -111,23 +111,28 @@ class CuroboPlanner:
     def validate_base_path(self, base_positions: np.ndarray,
                            target_pos: Optional[np.ndarray] = None,
                            base_radius: float = 0.20,
-                           target_exclusion_radius: float = 0.15) -> tuple:
+                           target_exclusion_radius: float = 0.15,
+                           base_box: Optional[dict] = None) -> tuple:
         """Validate that a base trajectory does not collide with kitchen fixtures.
 
-        Uses cuRobo's stored collision world (kitchen fixture cuboids).
-        Performs an AABB-vs-circle check in XY for each waypoint.
+        If base_box is given (keys: center_xy, half_extents), uses an oriented
+        bounding box (OBB) check via SAT — base_positions[:, 2] is treated as
+        world yaw of the OBB. Otherwise falls back to a circular footprint.
 
         Filters applied:
         - Waypoint 0 skipped (robot is there, known clear)
         - Walls/floors skipped (room boundaries that may contain robot)
         - Cuboids near the target skipped (base must approach target counters/sinks)
+        - Cuboids overlapping the start footprint skipped (false positives)
 
         Args:
             base_positions: (T, 3) world-frame waypoints (x, y, yaw)
             target_pos: optional [x, y, z] EE target — cuboids within
                 target_exclusion_radius of this XY are not collision-checked
-            base_radius: mobile base footprint radius in meters
+            base_radius: mobile base footprint radius (circle mode)
             target_exclusion_radius: XY radius around target where collision is allowed
+            base_box: optional dict with "center_xy" and "half_extents" describing
+                the base OBB in base_link's local frame
 
         Returns:
             (collision_detected: bool, first_idx: int, fixture_name: str)
@@ -135,11 +140,25 @@ class CuroboPlanner:
         if not self._world_cuboids or len(base_positions) <= 1:
             return False, -1, ""
 
-        # Identify cuboids that contain the start position — these have AABBs
-        # that overlap the robot's known-safe area, so checking against them
-        # produces false positives
+        use_obb = base_box is not None
+        if use_obb:
+            box_offset = np.array(base_box.get("center_xy", [0.0, 0.0]))
+            box_half = np.array(base_box["half_extents"])
+
+        # Compute start footprint to identify cuboids the robot already
+        # touches at spawn (these would otherwise yield false positives).
         start_x = float(base_positions[0, 0])
         start_y = float(base_positions[0, 1])
+        start_yaw = float(base_positions[0, 2]) if base_positions.shape[1] > 2 else 0.0
+
+        if use_obb:
+            cos_s, sin_s = np.cos(start_yaw), np.sin(start_yaw)
+            start_ox = start_x + cos_s * box_offset[0] - sin_s * box_offset[1]
+            start_oy = start_y + sin_s * box_offset[0] + cos_s * box_offset[1]
+            start_x_axis = (cos_s, sin_s)
+            start_y_axis = (-sin_s, cos_s)
+            start_margin = 0.05  # inflate AABBs slightly so touching counts as overlap
+
         start_inside = set()
         for c in self._world_cuboids:
             cx, cy = c["center"][0], c["center"][1]
@@ -147,10 +166,26 @@ class CuroboPlanner:
             cz, hz = c["center"][2], c["half_size"][2]
             if cz + hz < 0.0 or cz - hz > 0.5:
                 continue
-            # Use base_radius margin so cuboids touching start are also excluded
-            if (cx - hx - base_radius <= start_x <= cx + hx + base_radius and
-                cy - hy - base_radius <= start_y <= cy + hy + base_radius):
-                start_inside.add(c["name"])
+            if use_obb:
+                hx_m = hx + start_margin
+                hy_m = hy + start_margin
+                dx_c = cx - start_ox
+                dy_c = cy - start_oy
+                overlap = True
+                for ax, ay in [(1.0, 0.0), (0.0, 1.0), start_x_axis, start_y_axis]:
+                    dist = abs(dx_c * ax + dy_c * ay)
+                    aabb_proj = hx_m * abs(ax) + hy_m * abs(ay)
+                    obb_proj = (box_half[0] * abs(start_x_axis[0] * ax + start_x_axis[1] * ay) +
+                                box_half[1] * abs(start_y_axis[0] * ax + start_y_axis[1] * ay))
+                    if dist > obb_proj + aabb_proj:
+                        overlap = False
+                        break
+                if overlap:
+                    start_inside.add(c["name"])
+            else:
+                if (cx - hx - base_radius <= start_x <= cx + hx + base_radius and
+                    cy - hy - base_radius <= start_y <= cy + hy + base_radius):
+                    start_inside.add(c["name"])
 
         # Filter out walls/floors, target-adjacent cuboids, and start-containing cuboids
         active_cuboids = []
@@ -169,9 +204,19 @@ class CuroboPlanner:
             active_cuboids.append(c)
 
         r2 = base_radius * base_radius
+
         # Start from waypoint 1 — waypoint 0 is the current state (known clear)
         for idx in range(1, len(base_positions)):
             x, y = float(base_positions[idx, 0]), float(base_positions[idx, 1])
+            yaw = float(base_positions[idx, 2]) if base_positions.shape[1] > 2 else 0.0
+
+            if use_obb:
+                cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+                ox = x + cos_y * box_offset[0] - sin_y * box_offset[1]
+                oy = y + sin_y * box_offset[0] + cos_y * box_offset[1]
+                obb_x_axis = (cos_y, sin_y)
+                obb_y_axis = (-sin_y, cos_y)
+
             for c in active_cuboids:
                 cx, cy, cz = c["center"]
                 hx, hy, hz = c["half_size"]
@@ -180,13 +225,26 @@ class CuroboPlanner:
                 if cz + hz < 0.0 or cz - hz > 0.5:
                     continue
 
-                # Closest point on AABB-XY to (x, y)
-                dx = max(cx - hx - x, 0.0, x - (cx + hx))
-                dy = max(cy - hy - y, 0.0, y - (cy + hy))
-                if dx * dx + dy * dy < r2:
-                    return True, idx, c["name"]
-
-        return False, -1, ""
+                if use_obb:
+                    # SAT: separating axis test for OBB vs AABB in 2D
+                    dx_c = cx - ox
+                    dy_c = cy - oy
+                    overlap = True
+                    for ax, ay in [(1.0, 0.0), (0.0, 1.0), obb_x_axis, obb_y_axis]:
+                        dist = abs(dx_c * ax + dy_c * ay)
+                        aabb_proj = hx * abs(ax) + hy * abs(ay)
+                        obb_proj = (box_half[0] * abs(obb_x_axis[0] * ax + obb_x_axis[1] * ay) +
+                                    box_half[1] * abs(obb_y_axis[0] * ax + obb_y_axis[1] * ay))
+                        if dist > obb_proj + aabb_proj:
+                            overlap = False
+                            break
+                    if overlap:
+                        return True, idx, c["name"]
+                else:
+                    dx_c = max(cx - hx - x, 0.0, x - (cx + hx))
+                    dy_c = max(cy - hy - y, 0.0, y - (cy + hy))
+                    if dx_c * dx_c + dy_c * dy_c < r2:
+                        return True, idx, c["name"]
 
         return False, -1, ""
 

@@ -44,9 +44,9 @@ def _patch_scene_builders():
             ROBOT_FRONT_FACING_SIZE,
         )
 
-        # Register tidyverse front-facing size so the robot is placed
-        # far enough from the counter to avoid initial collisions.
-        ROBOT_FRONT_FACING_SIZE["tidyverse"] = 1.1
+        # Register tidyverse front-facing size. 0.8 = same as fetch robot.
+        # Closer to counter makes doors/cabinets reachable by the arm.
+        ROBOT_FRONT_FACING_SIZE["tidyverse"] = 0.8
 
         _orig_robocasa_init = RoboCasaSceneBuilder.initialize
 
@@ -140,11 +140,11 @@ class TidyVerse(BaseAgent):
 
     arm_stiffness = 1e3
     arm_damping = 1e2
-    arm_force_limit = 100
+    arm_force_limit = 500
 
     gripper_stiffness = 1e5
     gripper_damping = 2000
-    gripper_force_limit = 0.1
+    gripper_force_limit = 5000
     gripper_friction = 1
 
     base_stiffness = 1e3
