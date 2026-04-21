@@ -16,11 +16,18 @@ from typing import Optional
 class CuroboPlanner:
     """GPU-accelerated motion planner using NVIDIA cuRobo."""
 
+    # Lock values for the gripper fingers (match franka_tidyverse.yml lock_joints)
+    _FINGER_LOCKS = {"panda_finger_joint1": 0.04, "panda_finger_joint2": 0.04}
+    _ROBOT_CFG_YML = "franka_tidyverse.yml"
+
     def __init__(self, device: str = "cuda:0"):
         self._device = torch.device(device)
-        self._motion_gen = None
+        self._motion_gen = None       # whole-body (base free)
+        self._motion_gen_arm = None   # arm-only (base_x/y/z locked)
+        self._arm_only_cfg_dict = None
         self._warmed_up = False
         self._world_cuboids = []
+        self._last_arm_base_lock = None  # (x, y, z) of last update_locked_joints call
 
     def warmup(self):
         """One-time initialization: load robot config + CUDA JIT compile.
@@ -44,7 +51,7 @@ class CuroboPlanner:
             Cuboid(name="ground", pose=[0, 0, -0.5, 1, 0, 0, 0], dims=[10, 10, 0.01])
         ])
         mg_config = MotionGenConfig.load_from_robot_config(
-            robot_cfg="franka_tidyverse.yml",
+            robot_cfg=self._ROBOT_CFG_YML,
             world_model=dummy_world,
             tensor_args=tensor_args,
             interpolation_dt=0.05,
@@ -57,8 +64,31 @@ class CuroboPlanner:
         print("[curobo] Warming up CUDA kernels...")
         self._motion_gen.warmup()
 
+        # Load a second MotionGen with base joints locked, for lock_base=True mode.
+        # update_locked_joints requires the lock set to have the same cardinality as
+        # what was provided at init, so we initialize the full 5-joint lock set here
+        # (gripper fingers + base_x/y/z) and only vary the VALUES per plan call.
+        print("[curobo] Loading arm-only config (base joints locked)...")
+        from curobo.util_file import get_robot_configs_path, join_path, load_yaml
+        cfg_dict = load_yaml(join_path(get_robot_configs_path(), self._ROBOT_CFG_YML))
+        arm_locks = dict(self._FINGER_LOCKS)
+        arm_locks.update({"base_x": 0.0, "base_y": 0.0, "base_z": 0.0})
+        cfg_dict["robot_cfg"]["kinematics"]["lock_joints"] = arm_locks
+        self._arm_only_cfg_dict = cfg_dict
+        mg_config_arm = MotionGenConfig.load_from_robot_config(
+            robot_cfg=cfg_dict["robot_cfg"],
+            world_model=dummy_world,
+            tensor_args=tensor_args,
+            interpolation_dt=0.05,
+            collision_cache={"obb": 100, "mesh": 10},
+            collision_activation_distance=0.01,
+            use_cuda_graph=False,
+        )
+        self._motion_gen_arm = MotionGen(mg_config_arm)
+        self._motion_gen_arm.warmup()
+
         dt = time.time() - t0
-        print(f"[curobo] Ready ({dt:.1f}s)")
+        print(f"[curobo] Ready ({dt:.1f}s, whole_body + arm_only)")
         self._warmed_up = True
 
     def set_collision_world(self, cuboids: list[dict], robot_pos: Optional[np.ndarray] = None,
@@ -105,6 +135,8 @@ class CuroboPlanner:
 
         world_config = WorldConfig(cuboid=cu_cuboids)
         self._motion_gen.update_world(world_config)
+        if self._motion_gen_arm is not None:
+            self._motion_gen_arm.update_world(world_config)
         print(f"[curobo] Updated collision world: {len(cu_cuboids)} cuboids "
               f"(skipped {skipped_overlap} overlap, {skipped_far} far)")
 
@@ -299,8 +331,49 @@ class CuroboPlanner:
 
         world_config = WorldConfig(cuboid=cu_cuboids)
         self._motion_gen.update_world(world_config)
+        if self._motion_gen_arm is not None:
+            self._motion_gen_arm.update_world(world_config)
         print(f"[curobo] Collision world for target: {len(cu_cuboids)} cuboids "
               f"(excl {skipped_target} at target, {skipped_overlap} overlap, {skipped_far} far)")
+
+    def _select_mg(self, lock_base: bool, current_q: np.ndarray):
+        """Return (motion_gen, q_active) for the selected mode.
+
+        For lock_base=True, updates the arm-only MotionGen's base lock values
+        to match current_q[:3] (if changed since last call) and returns the
+        7-DOF arm slice of current_q. Otherwise returns the whole-body MotionGen
+        and the 10-DOF slice.
+        """
+        if lock_base:
+            if self._motion_gen_arm is None:
+                raise RuntimeError("lock_base=True requires warmup() to have completed")
+            base_key = (float(current_q[0]), float(current_q[1]), float(current_q[2]))
+            if base_key != self._last_arm_base_lock:
+                arm_locks = dict(self._FINGER_LOCKS)
+                arm_locks["base_x"] = base_key[0]
+                arm_locks["base_y"] = base_key[1]
+                arm_locks["base_z"] = base_key[2]
+                self._motion_gen_arm.update_locked_joints(
+                    arm_locks, self._arm_only_cfg_dict["robot_cfg"])
+                self._last_arm_base_lock = base_key
+            return self._motion_gen_arm, np.asarray(current_q[3:10], dtype=np.float32)
+        return self._motion_gen, np.asarray(current_q[:10], dtype=np.float32)
+
+    def _widen(self, partial: np.ndarray, current_q: np.ndarray,
+               lock_base: bool) -> np.ndarray:
+        """Widen an arm-only result back to 10-DOF (fixed base prepended)."""
+        if not lock_base:
+            return partial
+        if partial.ndim == 1:
+            full = np.zeros(10, dtype=partial.dtype)
+            full[:3] = current_q[:3]
+            full[3:] = partial
+            return full
+        T = partial.shape[0]
+        full = np.zeros((T, 10), dtype=partial.dtype)
+        full[:, :3] = current_q[:3]
+        full[:, 3:] = partial
+        return full
 
     def plan_pose(self, current_q: np.ndarray, target_pos: np.ndarray,
                   target_quat: np.ndarray, lock_base: bool = False,
@@ -311,7 +384,7 @@ class CuroboPlanner:
             current_q: Current joint state (10 values: base3 + arm7)
             target_pos: Target EE position [x, y, z] in world frame
             target_quat: Target EE orientation [w, x, y, z]
-            lock_base: If True, only plan arm motion (base stays fixed)
+            lock_base: If True, only plan arm motion (base stays fixed at current_q[:3])
             max_attempts: Number of planning attempts
 
         Returns:
@@ -328,21 +401,19 @@ class CuroboPlanner:
         robot_pos = current_q[:2] if len(current_q) >= 2 else None
         self._update_collision_for_target(target_pos, robot_pos=robot_pos)
 
-        # Build current joint state (10 active joints: base3 + arm7)
-        q_tensor = torch.tensor(current_q[:10], dtype=torch.float32,
-                                device=self._device).unsqueeze(0)
+        mg, q_active = self._select_mg(lock_base, current_q)
+        joint_names = mg.robot_cfg.kinematics.cspace.joint_names
 
-        # Get joint names from the motion gen cspace config
-        joint_names = self._motion_gen.robot_cfg.kinematics.cspace.joint_names
-
+        q_tensor = torch.as_tensor(q_active, dtype=torch.float32,
+                                   device=self._device).unsqueeze(0)
         current_state = JointState.from_position(q_tensor, joint_names=joint_names)
 
-        # Build goal pose
+        # Build goal pose (use np.array→as_tensor to avoid the slow list-of-ndarray path)
+        pos_np = np.asarray(target_pos, dtype=np.float32).reshape(1, 3)
+        quat_np = np.asarray(target_quat, dtype=np.float32).reshape(1, 4)
         goal = Pose(
-            position=torch.tensor([target_pos], dtype=torch.float32,
-                                  device=self._device),
-            quaternion=torch.tensor([target_quat], dtype=torch.float32,
-                                   device=self._device),
+            position=torch.as_tensor(pos_np, device=self._device),
+            quaternion=torch.as_tensor(quat_np, device=self._device),
         )
 
         plan_config = MotionGenPlanConfig(
@@ -359,19 +430,15 @@ class CuroboPlanner:
 
         t0 = time.time()
         try:
-            result = self._motion_gen.plan_single(
-                current_state, goal, plan_config
-            )
+            result = mg.plan_single(current_state, goal, plan_config)
             # If start state collision, retry with cleared collision world
             if not result.success[0] and "START_STATE" in str(result.status):
                 print(f"[curobo] Start state collision, retrying with cleared world")
                 from curobo.geom.types import WorldConfig as WC2, Cuboid as Cb2
-                self._motion_gen.update_world(WC2(cuboid=[
+                mg.update_world(WC2(cuboid=[
                     Cb2(name="ground", pose=[0,0,-1,1,0,0,0], dims=[0.01,0.01,0.01])
                 ]))
-                result = self._motion_gen.plan_single(
-                    current_state, goal, plan_config
-                )
+                result = mg.plan_single(current_state, goal, plan_config)
         except Exception as e:
             dt = time.time() - t0
             print(f"[curobo] Plan ERROR ({dt:.2f}s): {e}")
@@ -381,20 +448,25 @@ class CuroboPlanner:
 
         if result.success[0]:
             traj = result.get_interpolated_plan()
-            positions = traj.position.cpu().numpy()  # (T, 10)
-            print(f"[curobo] Plan OK ({dt:.2f}s): {positions.shape[0]} waypoints")
+            positions = traj.position.cpu().numpy()  # (T, 7) arm-only or (T, 10) whole-body
+            positions = self._widen(positions, current_q, lock_base)
+            print(f"[curobo] Plan OK ({dt:.2f}s, {'arm_only' if lock_base else 'whole_body'}): "
+                  f"{positions.shape[0]} waypoints")
             return positions
         else:
             print(f"[curobo] Plan FAILED ({dt:.2f}s): {result.status}")
             return None
 
     def plan_joints(self, current_q: np.ndarray,
-                    target_q: np.ndarray) -> Optional[np.ndarray]:
+                    target_q: np.ndarray,
+                    lock_base: bool = False) -> Optional[np.ndarray]:
         """Plan trajectory to target joint configuration.
 
         Args:
             current_q: Current joint state (10 values: base3 + arm7)
             target_q: Target joint state (10 values: base3 + arm7)
+            lock_base: If True, only plan arm motion (target_q[:3] ignored; base
+                held at current_q[:3])
 
         Returns:
             (T, 10) numpy array, or None on failure
@@ -405,17 +477,20 @@ class CuroboPlanner:
         if not self._warmed_up:
             self.warmup()
 
-        joint_names = self._motion_gen.robot_cfg.kinematics.cspace.joint_names
+        mg, q_active = self._select_mg(lock_base, current_q)
+        joint_names = mg.robot_cfg.kinematics.cspace.joint_names
+        target_active = np.asarray(target_q[3:10] if lock_base else target_q[:10],
+                                   dtype=np.float32)
 
         current_state = JointState.from_position(
-            torch.tensor(current_q[:10], dtype=torch.float32,
-                         device=self._device).unsqueeze(0),
+            torch.as_tensor(q_active, dtype=torch.float32,
+                            device=self._device).unsqueeze(0),
             joint_names=joint_names,
         )
 
         goal_state = JointState.from_position(
-            torch.tensor(target_q[:10], dtype=torch.float32,
-                         device=self._device).unsqueeze(0),
+            torch.as_tensor(target_active, dtype=torch.float32,
+                            device=self._device).unsqueeze(0),
             joint_names=joint_names,
         )
 
@@ -426,55 +501,131 @@ class CuroboPlanner:
         )
 
         t0 = time.time()
-        result = self._motion_gen.plan_single_js(
-            current_state, goal_state, plan_config
-        )
+        try:
+            result = mg.plan_single_js(current_state, goal_state, plan_config)
+            # Mirror plan_pose's recovery: if start-state collision, retry with
+            # cleared world, then restore the real world so future calls see
+            # the actual obstacles (plan_pose self-heals via _update_collision_for_target
+            # at the top of each call; plan_joints has no such entry hook).
+            if not result.success[0] and "START_STATE" in str(result.status):
+                print(f"[curobo] Joint plan start-state collision, retrying with cleared world")
+                from curobo.geom.types import WorldConfig as WC2, Cuboid as Cb2
+                mg.update_world(WC2(cuboid=[
+                    Cb2(name="ground", pose=[0,0,-1,1,0,0,0], dims=[0.01,0.01,0.01])
+                ]))
+                result = mg.plan_single_js(current_state, goal_state, plan_config)
+                if self._world_cuboids:
+                    robot_pos = (np.asarray(current_q[:2], dtype=np.float32)
+                                 if len(current_q) >= 2 else None)
+                    self.set_collision_world(self._world_cuboids, robot_pos=robot_pos)
+        except Exception as e:
+            dt = time.time() - t0
+            print(f"[curobo] Joint plan ERROR ({dt:.2f}s): {e}")
+            import traceback; traceback.print_exc()
+            return None
         dt = time.time() - t0
 
         if result.success[0]:
             traj = result.get_interpolated_plan()
             positions = traj.position.cpu().numpy()
-            print(f"[curobo] Joint plan OK ({dt:.2f}s): {positions.shape[0]} waypoints")
+            positions = self._widen(positions, current_q, lock_base)
+            print(f"[curobo] Joint plan OK ({dt:.2f}s, {'arm_only' if lock_base else 'whole_body'}): "
+                  f"{positions.shape[0]} waypoints")
             return positions
         else:
-            print(f"[curobo] Joint plan FAILED ({dt:.2f}s)")
+            print(f"[curobo] Joint plan FAILED ({dt:.2f}s): {result.status}")
             return None
 
     def solve_ik(self, target_pos: np.ndarray, target_quat: np.ndarray,
                  current_q: Optional[np.ndarray] = None,
-                 lock_base: bool = False) -> Optional[np.ndarray]:
+                 lock_base: bool = False,
+                 num_seeds: int = 40,
+                 return_closest: bool = True) -> Optional[np.ndarray]:
         """Solve IK for target EE pose.
 
         Args:
             target_pos: Target EE position [x, y, z]
-            target_quat: Target EE orientation [w, x, y, z]
-            current_q: Current joint state (10 values) as seed
-            lock_base: If True, only solve for arm joints
+            target_quat: Target EE orientation [w, x, y, z] (wxyz)
+            current_q: Current joint state (10 values: base3 + arm7).
+                Required when lock_base=True (used to pin base values).
+                When return_closest=True, also used to pick solution closest to current.
+            lock_base: If True, only solve for arm joints (base held at current_q[:3])
+            num_seeds: Number of GPU-parallel IK seeds (mplib n_init_qpos equivalent)
+            return_closest: If True and current_q provided, pick the returned solution
+                with minimum joint-space distance to current_q. Otherwise return cuRobo's
+                best (lowest cost) solution.
 
         Returns:
-            (10,) numpy array of joint positions, or None
+            (10,) numpy array of joint positions, or None on failure
         """
         from curobo.types.math import Pose
-        from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 
         if not self._warmed_up:
             self.warmup()
 
+        if lock_base and current_q is None:
+            raise ValueError("lock_base=True requires current_q to pin base values")
+
+        # Same target-exclusion collision filter as plan_pose: exclude cuboids
+        # within 0.5m of target so IK can find solutions that reach INTO fixtures
+        # (grasping into drawers/counters). Without this, targets inside a fixture
+        # AABB are unsolvable since EE would register as in-collision.
+        if self._world_cuboids:
+            robot_pos = current_q[:2] if current_q is not None and len(current_q) >= 2 else None
+            self._update_collision_for_target(np.asarray(target_pos), robot_pos=robot_pos)
+
+        # Select MotionGen based on mode (and update base locks if needed)
+        if lock_base:
+            mg, _ = self._select_mg(True, current_q)
+        else:
+            mg = self._motion_gen
+
+        pos_np = np.asarray(target_pos, dtype=np.float32).reshape(1, 3)
+        quat_np = np.asarray(target_quat, dtype=np.float32).reshape(1, 4)
         goal = Pose(
-            position=torch.tensor([target_pos], dtype=torch.float32,
-                                  device=self._device),
-            quaternion=torch.tensor([target_quat], dtype=torch.float32,
-                                   device=self._device),
+            position=torch.as_tensor(pos_np, device=self._device),
+            quaternion=torch.as_tensor(quat_np, device=self._device),
         )
 
-        # Use motion_gen's IK solver
-        result = self._motion_gen.ik(goal)
+        # Ask cuRobo for multiple solutions so we can pick closest to current_q.
+        # If return_closest is False or no current_q, 1 return_seed is enough.
+        want_multi = bool(return_closest and current_q is not None)
+        return_seeds = min(num_seeds, 8) if want_multi else 1
 
-        if result.success[0]:
-            q = result.solution[0].cpu().numpy()
-            return q
-        else:
+        t0 = time.time()
+        try:
+            result = mg.solve_ik(goal, num_seeds=num_seeds, return_seeds=return_seeds)
+        except Exception as e:
+            print(f"[curobo] IK ERROR ({time.time()-t0:.2f}s): {e}")
             return None
+        dt = time.time() - t0
+
+        if not bool(result.success.any()):
+            print(f"[curobo] IK FAILED ({dt:.2f}s, num_seeds={num_seeds})")
+            return None
+
+        # result.solution shape: (B=1, return_seeds, dof). Pick best.
+        sol = result.solution[0].cpu().numpy()          # (return_seeds, dof)
+        succ = result.success[0].cpu().numpy().astype(bool)  # (return_seeds,)
+        # Filter to successful solutions only
+        sol_ok = sol[succ]
+        if sol_ok.shape[0] == 0:
+            return None
+
+        if want_multi:
+            # Pick closest to current_q in the active DOF space
+            ref = current_q[3:10] if lock_base else current_q[:10]
+            ref = np.asarray(ref, dtype=sol_ok.dtype)
+            dists = np.linalg.norm(sol_ok - ref[None, :], axis=1)
+            chosen = sol_ok[int(np.argmin(dists))]
+        else:
+            chosen = sol_ok[0]
+
+        print(f"[curobo] IK OK ({dt:.2f}s, num_seeds={num_seeds}, "
+              f"{int(succ.sum())}/{len(succ)} succeeded)")
+
+        return self._widen(chosen, current_q if current_q is not None else np.zeros(10),
+                           lock_base)
 
 
 def build_collision_cuboids_from_fixtures(scene, fixtures_dict) -> list[dict]:
