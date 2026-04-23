@@ -36,6 +36,7 @@ robot_cfg:
     # link_names: null
     collision_link_names:
       [
+        "base_link_z",
         "panda_link0",
         "panda_link1",
         "panda_link2",
@@ -49,13 +50,14 @@ robot_cfg:
         "panda_rightfinger",
         "attached_object",
       ]
-    collision_spheres: "spheres/franka_mesh.yml"
+    collision_spheres: "spheres/franka_tidyverse_mesh.yml"
     collision_sphere_buffer: 0.002 #0.02
     extra_collision_spheres: {"attached_object": 4}
     use_global_cumul: True
     self_collision_ignore:
       {
-        "panda_link0": ["panda_link1", "panda_link2"],
+        "base_link_z": ["panda_link0", "panda_link1", "panda_link2", "panda_link3"],
+        "panda_link0": ["panda_link1", "panda_link2", "base_link_z"],
         "panda_link1": ["panda_link2", "panda_link3", "panda_link4"],
         "panda_link2": ["panda_link3", "panda_link4"],
         "panda_link3": ["panda_link4", "panda_link6"],

@@ -17,3 +17,7 @@ realsense2_description
 robotiq_meshes
 *.egg-info/
 tidybot_uni/
+# Exception: track small URDF edits under curobo_assets/ (meshes stay ignored
+# via the bare franka_description pattern above).
+!curobo_assets/robot/franka_description/
+!curobo_assets/robot/franka_description/*.urdf
